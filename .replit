@@ -16,3 +16,19 @@ deploymentTarget = "gce"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[workflows]
+runButton = "Start Streamlit"
+
+[[workflows.workflow]]
+name = "Start Streamlit"
+mode = "sequential"
+author = 14443883
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pip install -r requirements.txt"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "streamlit run main.py"
