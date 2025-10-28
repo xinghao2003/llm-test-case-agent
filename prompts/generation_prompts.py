@@ -128,3 +128,98 @@ Return ONLY new security-focused pytest test functions.
 
 SECURITY TESTS:
 """
+
+CODEBASE_AWARE_GENERATION_PROMPT = """You are an expert software testing engineer specializing in Python and pytest. Generate pytest tests for a user story by analyzing the actual codebase.
+
+USER STORY:
+{user_story}
+
+CONTEXT:
+{additional_context}
+
+CODEBASE INFORMATION:
+{codebase_context}
+
+REQUIREMENTS:
+- Import actual functions/classes from the codebase using the correct module paths
+- Use real function signatures (parameters, return types)
+- Generate tests that will actually work with the provided code
+- Include appropriate imports at the top
+- Follow the existing code style and patterns
+- Use real data types and structures from the codebase
+
+IMPORTANT:
+- Use "from {module_path} import {function_name}" for actual imports
+- Call functions with correct parameter names and types
+- Assert on actual return types and structures
+- Consider the actual implementation's edge cases
+
+Example with real imports:
+```python
+import pytest
+from src.auth.registration import register_user, UserAlreadyExistsError
+from src.models.user import User
+
+def test_successful_registration():
+    \"\"\"Test user registration with valid credentials\"\"\"
+    # Arrange
+    email = "test@example.com"
+    password = "SecurePass123!"
+
+    # Act
+    result = register_user(email, password)
+
+    # Assert
+    assert isinstance(result, User)
+    assert result.email == email
+    assert result.password != password  # Should be hashed
+
+def test_duplicate_registration_raises_error():
+    \"\"\"Test that duplicate email raises UserAlreadyExistsError\"\"\"
+    # Arrange
+    email = "existing@example.com"
+    password = "Pass123!"
+    register_user(email, password)  # First registration
+
+    # Act & Assert
+    with pytest.raises(UserAlreadyExistsError):
+        register_user(email, password)  # Duplicate attempt
+```
+
+Generate comprehensive tests covering:
+1. Happy path scenarios with actual function calls
+2. Edge cases based on actual code logic
+3. Error handling with actual exception types
+4. Input validation using actual validators
+5. Integration points with real dependencies
+
+GENERATED TESTS:
+"""
+
+CODEBASE_ITERATIVE_PROMPT = """Generate ADDITIONAL tests for existing codebase tests, filling coverage gaps.
+
+USER STORY:
+{user_story}
+
+EXISTING TESTS:
+{existing_tests}
+
+CODEBASE INFORMATION:
+{codebase_context}
+
+COVERAGE GAPS:
+{gaps}
+
+FOCUS AREAS:
+{focus_areas}
+
+Generate ONLY NEW tests that:
+- Use actual imports from the codebase
+- Address the identified gaps
+- Don't duplicate existing tests
+- Call real functions with correct signatures
+
+Return ONLY valid Python code with NEW pytest test functions.
+
+ADDITIONAL TESTS:
+"""

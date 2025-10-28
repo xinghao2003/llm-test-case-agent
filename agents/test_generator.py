@@ -10,7 +10,9 @@ from prompts.generation_prompts import (
     INITIAL_GENERATION_PROMPT,
     ITERATIVE_GENERATION_PROMPT,
     REFINEMENT_PROMPT,
-    SECURITY_FOCUSED_PROMPT
+    SECURITY_FOCUSED_PROMPT,
+    CODEBASE_AWARE_GENERATION_PROMPT,
+    CODEBASE_ITERATIVE_PROMPT
 )
 
 
@@ -305,3 +307,95 @@ class TestGenerator:
         # Combine
         merged = '\n'.join(sorted(imports)) + '\n\n' + '\n\n'.join(tests)
         return merged
+
+    def generate_from_codebase(
+        self,
+        user_story: str,
+        codebase_context: str,
+        additional_context: str = ""
+    ) -> Dict[str, any]:
+        """
+        Generate tests from user story with actual codebase analysis
+
+        Args:
+            user_story: The user story describing functionality
+            codebase_context: Formatted codebase information (functions, classes, etc.)
+            additional_context: Additional requirements
+
+        Returns:
+            Dict with 'code', 'raw_response', and 'metadata'
+        """
+        prompt = CODEBASE_AWARE_GENERATION_PROMPT.format(
+            user_story=user_story,
+            additional_context=additional_context or "No additional context provided.",
+            codebase_context=codebase_context
+        )
+
+        raw_response = self._call_llm(prompt)
+        code = self._extract_code_from_response(raw_response)
+
+        test_count = len(re.findall(r'\ndef test_', code))
+
+        return {
+            'code': code,
+            'raw_response': raw_response,
+            'metadata': {
+                'test_count': test_count,
+                'generation_type': 'codebase_aware',
+                'has_imports': 'import' in code,
+                'has_real_imports': 'from ' in code
+            }
+        }
+
+    def generate_additional_tests_from_codebase(
+        self,
+        user_story: str,
+        existing_tests: str,
+        codebase_context: str,
+        gaps: List[Dict],
+        focus_areas: Optional[List[str]] = None
+    ) -> Dict[str, any]:
+        """
+        Generate additional tests to fill gaps, using codebase context
+
+        Args:
+            user_story: Original user story
+            existing_tests: Previously generated test code
+            codebase_context: Formatted codebase information
+            gaps: List of identified coverage gaps
+            focus_areas: Specific areas to focus on
+
+        Returns:
+            Dict with 'code', 'raw_response', and 'metadata'
+        """
+        # Format gaps for the prompt
+        gaps_text = "\n".join([
+            f"- {gap.get('category', 'general')}: {gap.get('description', '')}"
+            for gap in gaps
+        ])
+
+        focus_text = ", ".join(focus_areas) if focus_areas else "general coverage improvement"
+
+        prompt = CODEBASE_ITERATIVE_PROMPT.format(
+            user_story=user_story,
+            existing_tests=existing_tests,
+            codebase_context=codebase_context,
+            gaps=gaps_text,
+            focus_areas=focus_text
+        )
+
+        raw_response = self._call_llm(prompt)
+        code = self._extract_code_from_response(raw_response)
+
+        test_count = len(re.findall(r'\ndef test_', code))
+
+        return {
+            'code': code,
+            'raw_response': raw_response,
+            'metadata': {
+                'test_count': test_count,
+                'generation_type': 'codebase_iterative',
+                'gaps_addressed': len(gaps),
+                'focus_areas': focus_areas
+            }
+        }
