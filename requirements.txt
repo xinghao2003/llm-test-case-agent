@@ -1,5 +1,11 @@
-streamlit
-requests
-reportlab
-markdown
-pdfkit
+streamlit>=1.28.0
+openai>=1.3.0
+nltk>=3.8.1
+pdfkit>=1.0.0
+markdown>=3.5
+requests>=2.31.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+plotly>=5.17.0
+pytest>=7.4.0
+reportlab>=4.0.0
