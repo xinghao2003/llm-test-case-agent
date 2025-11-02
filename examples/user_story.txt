@@ -1,0 +1,12 @@
+As a registered user,
+I want to log in using my email and password,
+so that I can securely access my personal dashboard.
+
+Acceptance Criteria
+    The system must validate that both email and password fields are not empty.
+    The system must verify that the entered email exists in the database.
+    The password entered must match the stored password (hashed).
+    If the credentials are valid, the user should be redirected to the dashboard.
+    If invalid credentials are entered, an error message “Invalid email or password” should be displayed.
+    The login form must follow password masking for security.
+    The system must log unsuccessful login attempts for security tracking.

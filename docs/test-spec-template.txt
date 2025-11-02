@@ -1,0 +1,95 @@
+# **Test Case Specification Template**
+
+**Module Name:**
+**Test Case ID:**
+**Tester Name:**
+
+---
+
+### **Test Case Description**
+
+> *Describe the purpose of this test case.*
+
+---
+
+### **Prerequisites**
+
+1.
+2.
+
+---
+
+### **Environmental Information**
+
+| Item                   | Details          |
+| ---------------------- | ---------------- |
+| **Operating System**   |                  |
+| **System Type**        | Laptop / Desktop |
+| **Browser / Platform** |                  |
+
+---
+
+### **Test Scenario**
+
+> *Describe what is being tested and why.*
+
+---
+
+## **Test Case Details**
+
+| **Test Case ID** | **Test Steps**   | **Test Input** | **Expected Results** | **Actual Results** | **Status**  | **Comments** |
+| ---------------- | ---------------- | -------------- | -------------------- | ------------------ | ----------- | ------------ |
+| 1                | 1. <br>2. <br>3. |                |                      |                    | Pass / Fail |              |
+
+---
+
+### **Notes**
+
+* Use **Pass / Fail** under *Status* consistently.
+* Attach screenshots, logs, or evidence if needed.
+* Keep *Expected Results* clear and measurable.
+
+---
+
+## **Example**
+
+**Module Name:** Login
+**Test Case ID:** gfg_01
+**Tester Name:** Geek
+
+---
+
+### **Test Case Description**
+
+To verify login functionality of the GeeksforGeeks website.
+
+---
+
+### **Prerequisites**
+
+1. Stable internet connection
+2. Browser (Chrome, Firefox, Internet Explorer, etc.)
+
+---
+
+### **Environmental Information**
+
+| Item                   | Details                              |
+| ---------------------- | ------------------------------------ |
+| **Operating System**   | Windows / Linux / Mac                |
+| **System Type**        | Laptop / Desktop                     |
+| **Browser / Platform** | Chrome / Firefox / Internet Explorer |
+
+---
+
+### **Test Scenario**
+
+Checking that after entering the correct username and password, the user can successfully log in.
+
+---
+
+## **Test Case Details**
+
+| **Test Case ID** | **Test Steps**                                              | **Test Input**                                   | **Expected Results**                        | **Actual Results**                          | **Status** | **Comments**    |
+| ---------------- | ----------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------- | ---------- | --------------- |
+| 1                | 1. Enter Username<br>2. Enter Password<br>3. Click on Login | Username: `geeksforgeeks`<br>Password: `geek123` | "Welcome to GeeksforGeeks!" message appears | "Welcome to GeeksforGeeks!" message appears |  Pass     | No issues found |

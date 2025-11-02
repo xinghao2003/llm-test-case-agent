@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="container">
+        <h1>Dashboard</h1>
+        <p>Welcome, {{ display_name }}!</p>
+        <p>You have successfully logged in.</p>
+        <a class="link" href="{{ url_for('logout') }}">Sign out</a>
+    </main>
+</body>
+</html>
