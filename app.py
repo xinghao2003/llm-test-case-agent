@@ -25,6 +25,12 @@ from pathspec import PathSpec
 MAX_TOTAL_TEXT = 250_000
 ALLOWED_EXTENSIONS = {".zip", ".txt", ".md", ".pdf", ".jpg", ".jpeg", ".png"}
 
+INITIAL_ASSISTANT_MESSAGE = (
+    "📎 **Tip:** Attach your codebase ZIP, PDFs, images, or text files via the paperclip icon in your first "
+    "message. Describe the tests you need and continue chatting to iterate. Clear the chat to start over with "
+    "different files."
+)
+
 SYSTEM_PROMPT = """\
 You are a senior QA engineer and software architect generating and improving automated test plans and code for a Python project.
 
@@ -173,6 +179,36 @@ Checking that after entering the correct username and password, the user can suc
 - Use parallel function calls when creating multiple independent files.
 - Reference previous iterations when making improvements.
 """
+
+
+def empty_chat_input() -> Dict[str, Any]:
+    """Return a fresh multimodal chat payload with no text or files."""
+    return {"text": "", "files": []}
+
+
+def normalize_uploaded_entry(entry: Any) -> Tuple[Optional[Path], Optional[str]]:
+    """Extract a filesystem path and display name from a Gradio upload payload."""
+    candidate_path: Optional[Path] = None
+    display_name: Optional[str] = None
+
+    if isinstance(entry, dict):
+        raw_path = entry.get("path") or entry.get("name") or entry.get("file")
+        if raw_path:
+            candidate_path = Path(raw_path)
+        display_name = entry.get("orig_name") or entry.get("name")
+    elif isinstance(entry, Path):
+        candidate_path = entry
+    elif isinstance(entry, str):
+        candidate_path = Path(entry)
+    elif hasattr(entry, "name"):
+        candidate_path = Path(getattr(entry, "name"))
+    elif hasattr(entry, "path"):
+        candidate_path = Path(getattr(entry, "path"))
+
+    if not display_name and candidate_path is not None:
+        display_name = candidate_path.name
+
+    return candidate_path, display_name
 
 # ---------- Logger Setup ----------
 
@@ -771,7 +807,14 @@ def process_uploads(uploads, work_dir: Path) -> Tuple[List[Path], List[Path]]:
     if not uploads:
         return context_files, zip_files
     for upload in uploads:
-        src_path = Path(upload.name if hasattr(upload, "name") else upload)
+        candidate, _ = normalize_uploaded_entry(upload)
+        if candidate is None:
+            logger.warning("Skipping upload with no resolvable path: %r", upload)
+            continue
+        if not candidate.exists():
+            logger.warning("Skipping missing uploaded file: %s", candidate)
+            continue
+        src_path = candidate
         category = categorize_upload(src_path)
         if not category:
             continue
@@ -921,7 +964,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path)
         "total_files_created": sum(1 for f in created_files if f.get("status") == "success")
     }
 
-def infer(uploads, user_story: str, create_zip: bool, conversation_history: List[Dict[str, str]], session_state: Dict[str, Any]):
+def infer(user_story: str, attached_files: List[Path], create_zip: bool, conversation_history: List[Dict[str, str]], session_state: Dict[str, Any]):
     session_state = dict(session_state or {})
     session_id = session_state.get('session_id') or datetime.now().strftime('%Y%m%d_%H%M%S')
     logger.info(f"=== Processing request in session: {session_id} ===")
@@ -941,15 +984,21 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
             "session_state": session_state
         }
 
-    if not user_story or not user_story.strip():
+    sanitized_story = (user_story or "").strip()
+    attachment_paths = [Path(p) for p in (attached_files or [])]
+
+    if not sanitized_story and not attachment_paths:
         yield {
             "type": "final",
-            "message": "⚠️ Please provide a requirement or request.",
+            "message": "⚠️ Please provide a request or attach files.",
             "zip_path": None,
             "conversation_history": conversation_history,
             "session_state": session_state
         }
         return
+
+    if not sanitized_story and attachment_paths:
+        sanitized_story = "User uploaded new context files. Continue processing with these artifacts."
 
     try:
         yield emit_progress("🔌 Initializing Gemini client…")
@@ -968,7 +1017,7 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
         if not session_state or work_dir is None:
             work_dir = Path(tempfile.mkdtemp(prefix="poc_ctx_"))
             yield emit_progress("📥 Ingesting uploads…")
-            context_files, zip_files = process_uploads(uploads, work_dir)
+            context_files, zip_files = process_uploads(attachment_paths, work_dir)
             yield emit_progress("📥 Ingesting uploads ✅", replace_last=True)
 
             yield emit_progress("🧩 Flattening codebase (zip → text)…")
@@ -996,7 +1045,7 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
                 'context_files': [str(f) for f in context_files],
                 'original_codebase_dir': str(original_codebase_path) if original_codebase_path else None
             }
-            save_llm_context(user_story, repo_contents, context_files)
+            save_llm_context(sanitized_story, repo_contents, context_files)
         else:
             work_dir = Path(work_dir)
             original_codebase_path = Path(original_codebase_path) if original_codebase_path else None
@@ -1004,7 +1053,7 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
         yield emit_progress("🤖 Calling LLM (with create_file tool)…")
         turn_start = time.time()
 
-        contents = build_llm_request(user_story, repo_contents, uploaded_refs, conversation_history)
+        contents = build_llm_request(sanitized_story, repo_contents, uploaded_refs, conversation_history)
         result = call_gemini_model(client, contents, work_dir)
         yield emit_progress("🤖 LLM response received ✅", replace_last=True)
 
@@ -1030,7 +1079,7 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
         progress_lines.append("✅ Completed. See summary below." if summary else "✅ Completed.")
 
         updated_history = conversation_history + [{
-            'user': user_story,
+            'user': sanitized_story,
             'assistant_summary': (summary[:500] if summary else f"Created {success_count} files")
         }]
 
@@ -1062,7 +1111,7 @@ def infer(uploads, user_story: str, create_zip: bool, conversation_history: List
 with gr.Blocks(css="footer {visibility: hidden}") as demo:
     gr.Markdown(
         "# 🧪 User Story Test Generator\n"
-        "Upload PDFs/Images/ZIP (codebase) → Generate test assets → Iterate to refine results\n\n"
+        "Attach ZIPs/PDFs/images directly in chat → Generate test assets → Iterate to refine results\n\n"
     )
 
     conversation_state = gr.State([])
@@ -1070,54 +1119,92 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
 
     with gr.Column():
         with gr.Group():
-            gr.Markdown("### Upload Context")
-            uploads = gr.File(
-                label="📤 Upload Files (First Message Only)",
+            gr.Markdown("### Conversation")
+            chatbot = gr.Chatbot(
+                label="💬 Conversation",
+                height=480,
+                type="messages",
+                value=[{"role": "assistant", "content": INITIAL_ASSISTANT_MESSAGE}]
+            )
+            message_input = gr.MultimodalTextbox(
+                label="Your Request (files optional)",
+                placeholder="Describe what to test and optionally attach context files…",
                 file_count="multiple",
-                file_types=list(ALLOWED_EXTENSIONS)
+                sources=["upload"],
+                file_types=["file"]
             )
             gr.Markdown(
-                "**Tip:** Upload your codebase ZIP and any PDFs/images once. Then continue the conversation to refine results."
-            )
-            create_zip = gr.Checkbox(
-                label="📦 Create ZIP with original codebase + generated files",
-                value=True
-            )
-
-        with gr.Group():
-            gr.Markdown("### Conversation")
-            chatbot = gr.Chatbot(label="💬 Conversation", height=480, type="messages")
-            user_input = gr.Textbox(
-                label="Your Request (User Story)",
-                lines=3,
-                placeholder="Describe what to test… e.g. 'Generate tests for login and error handling.'"
+                "_Attach files in your first message via the paperclip icon. Clear the chat to upload a different set._"
             )
             with gr.Row():
+                create_zip = gr.Checkbox(
+                    label="📦 Bundle ZIP with original codebase + generated files",
+                    value=True
+                )
                 send_btn = gr.Button("Send", variant="primary", scale=3)
                 clear_btn = gr.Button("Clear Chat", scale=1)
 
-        with gr.Group():
-            gr.Markdown("### Downloads")
-            out_zip = gr.File(label="📥 Download Latest ZIP", interactive=False)
-
-    def send_message(uploads, user_msg, create_zip, conv_history, conv_state, sess_state):
+    def send_message(user_msg, create_zip, conv_history, conv_state, sess_state):
         conv_history = list(conv_history or [])
         conv_state = list(conv_state or [])
         sess_state = dict(sess_state or {})
 
-        if not user_msg or not user_msg.strip():
-            conv_history.append({"role": "assistant", "content": "⚠️ Please enter a message."})
-            yield conv_history, "", None, conv_state, sess_state
+        message_text = ""
+        message_files_info: List[Tuple[Optional[Path], str]] = []
+
+        if isinstance(user_msg, dict):
+            message_text = (user_msg.get("text") or "").strip()
+            for raw_entry in user_msg.get("files") or []:
+                path, display_name = normalize_uploaded_entry(raw_entry)
+                if not path and not display_name:
+                    continue
+                message_files_info.append((path, display_name or "(file)"))
+        else:
+            message_text = str(user_msg or "").strip()
+
+        if not message_text and not message_files_info:
+            conv_history.append({"role": "assistant", "content": "⚠️ Please enter a message or attach files."})
+            yield conv_history, empty_chat_input(), conv_state, sess_state
             return
 
-        conv_history.append({"role": "user", "content": user_msg})
+        user_display_parts: List[str] = []
+        if message_text:
+            user_display_parts.append(message_text)
+        if message_files_info:
+            filenames = ", ".join(display for _, display in message_files_info)
+            user_display_parts.append(f"📎 Files: {filenames}")
+        if not user_display_parts:
+            user_display_parts.append("(no message provided)")
+
+        conv_history.append({"role": "user", "content": "\n\n".join(user_display_parts)})
+
+        missing_files = [
+            display
+            for path, display in message_files_info
+            if (path is None) or (path and not path.exists())
+        ]
+        if missing_files:
+            conv_history.append({
+                "role": "assistant",
+                "content": f"⚠️ Skipping missing file(s): {', '.join(missing_files)}"
+            })
+
+        attachments_to_process = [path for path, _ in message_files_info if path and path.exists()]
+        if message_files_info and sess_state.get("work_dir"):
+            warning = (
+                "⚠️ New file uploads are ignored after the first message. Clear the chat to start a "
+                "fresh session if you need to provide different files."
+            )
+            conv_history.append({"role": "assistant", "content": warning})
+            attachments_to_process = []
+            attachments_to_process = []
+
         conv_history.append({"role": "assistant", "content": "⏳ Preparing request…"})
 
-        yield conv_history, "", None, conv_state, sess_state
+        yield conv_history, empty_chat_input(), conv_state, sess_state
 
         try:
-            inference = infer(uploads, user_msg, create_zip, conv_state, sess_state)
-            current_zip = None
+            inference = infer(message_text, attachments_to_process, create_zip, conv_state, sess_state)
             updated_history = conv_state
             updated_session_state = sess_state
 
@@ -1126,41 +1213,60 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
                 if update_type == "progress":
                     conv_history[-1]["content"] = update.get("message", "")
                     updated_session_state = update.get("session_state", updated_session_state)
-                    yield conv_history, "", current_zip, updated_history, updated_session_state
+                    yield conv_history, empty_chat_input(), updated_history, updated_session_state
                 elif update_type == "final":
                     conv_history[-1]["content"] = update.get("message", "")
-                    current_zip = update.get("zip_path")
                     updated_history = update.get("conversation_history", updated_history)
                     updated_session_state = update.get("session_state", updated_session_state)
-                    yield conv_history, "", current_zip, updated_history, updated_session_state
+                    bundle_path = update.get("zip_path")
+                    if bundle_path:
+                        bundle = Path(bundle_path)
+                        if bundle.exists():
+                            try:
+                                conv_history.append({
+                                    "role": "assistant",
+                                    "content": gr.File(value=str(bundle), label="Download generated bundle")
+                                })
+                            except Exception as exc:  # pylint: disable=broad-except
+                                logger.warning("Failed to attach bundle to chat: %s", exc)
+                                conv_history.append({
+                                    "role": "assistant",
+                                    "content": f"Download bundle: {bundle.as_posix()}"
+                                })
+                        else:
+                            conv_history.append({
+                                "role": "assistant",
+                                "content": f"Bundle missing on disk: {bundle.as_posix()}"
+                            })
+                    yield conv_history, empty_chat_input(), updated_history, updated_session_state
                     return
 
             conv_history[-1]["content"] = "❌ Inference interrupted unexpectedly."
-            yield conv_history, "", current_zip, updated_history, updated_session_state
+            yield conv_history, empty_chat_input(), updated_history, updated_session_state
 
         except Exception as exc:
             logger.error(f"send_message failed: {exc}", exc_info=True)
             conv_history[-1]["content"] = f"❌ Error: {exc}"
-            yield conv_history, "", None, conv_state, sess_state
+            yield conv_history, empty_chat_input(), conv_state, sess_state
 
     def clear_chat():
-        return [], "", None, [], {}
+        return [], empty_chat_input(), [], {}
 
     send_btn.click(
         send_message,
-        inputs=[uploads, user_input, create_zip, chatbot, conversation_state, session_state],
-        outputs=[chatbot, user_input, out_zip, conversation_state, session_state]
+        inputs=[message_input, create_zip, chatbot, conversation_state, session_state],
+        outputs=[chatbot, message_input, conversation_state, session_state]
     )
 
-    user_input.submit(
+    message_input.submit(
         send_message,
-        inputs=[uploads, user_input, create_zip, chatbot, conversation_state, session_state],
-        outputs=[chatbot, user_input, out_zip, conversation_state, session_state]
+        inputs=[message_input, create_zip, chatbot, conversation_state, session_state],
+        outputs=[chatbot, message_input, conversation_state, session_state]
     )
 
     clear_btn.click(
         clear_chat,
-        outputs=[chatbot, user_input, out_zip, conversation_state, session_state]
+        outputs=[chatbot, message_input, conversation_state, session_state]
     )
 
 if __name__ == "__main__":
