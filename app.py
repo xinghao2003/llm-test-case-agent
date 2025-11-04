@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Tuple, Optional, Set
 
 from dotenv import load_dotenv
 import gradio as gr
+from gradio import ChatMessage
 import yaml
 import pathspec
 from pathspec import PathSpec
@@ -180,10 +181,6 @@ Checking that after entering the correct username and password, the user can suc
 - Reference previous iterations when making improvements.
 """
 
-
-def empty_chat_input() -> Dict[str, Any]:
-    """Return a fresh multimodal chat payload with no text or files."""
-    return {"text": "", "files": []}
 
 
 def normalize_uploaded_entry(entry: Any) -> Tuple[Optional[Path], Optional[str]]:
@@ -1106,7 +1103,108 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
             "session_state": session_state
         }
 
-# ---------- Gradio UI (progress inside chat box) ----------
+# ---------- Chat Interface ----------
+
+
+def chat_handler(
+    message: Any,
+    history: List[Dict[str, Any]],
+    create_zip_opt: bool,
+    conversation_state_value: List[Dict[str, Any]],
+    session_state_value: Dict[str, Any]
+):
+    conv_state = list(conversation_state_value or [])
+    sess_state = dict(session_state_value or {})
+
+    if isinstance(message, dict):
+        message_dict = message
+    else:
+        message_dict = {"text": str(message or ""), "files": []}
+
+    message_text = (message_dict.get("text") or "").strip()
+    file_infos: List[Tuple[Optional[Path], str]] = []
+    for entry in message_dict.get("files") or []:
+        path, display = normalize_uploaded_entry(entry)
+        if not path and not display:
+            continue
+        label = display or (path.name if path else "(file)")
+        file_infos.append((path, label))
+
+    if not message_text and not file_infos:
+        yield "⚠️ Please enter a message or attach files.", conv_state, sess_state
+        return
+
+    missing_files = [label for path, label in file_infos if path is None or not path.exists()]
+    if missing_files:
+        yield f"⚠️ Skipping missing file(s): {', '.join(missing_files)}", conv_state, sess_state
+
+    attachments_to_process = [path for path, _ in file_infos if path and path.exists()]
+    if file_infos and sess_state.get("work_dir"):
+        warning = (
+            "⚠️ New file uploads are ignored after the first message. Clear the chat to start a fresh session if you "
+            "need to provide different files."
+        )
+        yield warning, conv_state, sess_state
+        attachments_to_process = []
+
+    sanitized_story = message_text
+    if not sanitized_story and attachments_to_process:
+        sanitized_story = "User uploaded new context files. Continue processing with these artifacts."
+
+    if not sanitized_story and not attachments_to_process:
+        yield "⚠️ Nothing to process yet. Provide instructions or new files.", conv_state, sess_state
+        return
+
+    progress_msg = ChatMessage(
+        content="Initializing…",
+        metadata={"title": "_Processing_", "id": "progress", "status": "pending"}
+    )
+    yield progress_msg, conv_state, sess_state
+
+    try:
+        inference = infer(sanitized_story, attachments_to_process, bool(create_zip_opt), conv_state, sess_state)
+        current_conv = conv_state
+        current_session = sess_state
+
+        for update in inference:
+            update_type = update.get("type")
+            current_session = update.get("session_state", current_session)
+            current_conv = update.get("conversation_history", current_conv)
+            content = update.get("message", "")
+
+            if update_type == "progress":
+                progress_msg.content = content
+                progress_msg.metadata["log"] = content
+                progress_msg.metadata["status"] = "pending"
+                yield progress_msg, current_conv, current_session
+            elif update_type == "final":
+                progress_msg.content = content
+                progress_msg.metadata["log"] = content
+                progress_msg.metadata["status"] = "done"
+
+                yield progress_msg, current_conv, current_session
+
+                bundle_path = update.get("zip_path")
+                if bundle_path:
+                    bundle = Path(bundle_path)
+                    if bundle.exists():
+                        yield gr.File(value=str(bundle), label="Download generated bundle"), current_conv, current_session
+                    else:
+                        yield f"Bundle missing on disk: {bundle.as_posix()}", current_conv, current_session
+                return
+
+            sess_state = current_session
+            conv_state = current_conv
+
+        progress_msg.content = "❌ Inference interrupted unexpectedly."
+        progress_msg.metadata["status"] = "done"
+        progress_msg.metadata["log"] = progress_msg.content
+        yield progress_msg, current_conv, current_session
+
+    except Exception as exc:
+        logger.error("chat_handler failed: %s", exc, exc_info=True)
+        yield f"❌ Error: {exc}", conv_state, sess_state
+
 
 with gr.Blocks(css="footer {visibility: hidden}") as demo:
     gr.Markdown(
@@ -1114,159 +1212,35 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
         "Attach ZIPs/PDFs/images directly in chat → Generate test assets → Iterate to refine results\n\n"
     )
 
+    create_zip_checkbox = gr.Checkbox(
+        label="📦 Bundle ZIP with original codebase + generated files",
+        value=True
+    )
     conversation_state = gr.State([])
     session_state = gr.State({})
 
-    with gr.Column():
-        with gr.Group():
-            gr.Markdown("### Conversation")
-            chatbot = gr.Chatbot(
-                label="💬 Conversation",
-                height=480,
-                type="messages",
-                value=[{"role": "assistant", "content": INITIAL_ASSISTANT_MESSAGE}]
-            )
-            message_input = gr.MultimodalTextbox(
-                label="Your Request (files optional)",
-                placeholder="Describe what to test and optionally attach context files…",
-                file_count="multiple",
-                sources=["upload"],
-                file_types=["file"]
-            )
-            gr.Markdown(
-                "_Attach files in your first message via the paperclip icon. Clear the chat to upload a different set._"
-            )
-            with gr.Row():
-                create_zip = gr.Checkbox(
-                    label="📦 Bundle ZIP with original codebase + generated files",
-                    value=True
-                )
-                send_btn = gr.Button("Send", variant="primary", scale=3)
-                clear_btn = gr.Button("Clear Chat", scale=1)
-
-    def send_message(user_msg, create_zip, conv_history, conv_state, sess_state):
-        conv_history = list(conv_history or [])
-        conv_state = list(conv_state or [])
-        sess_state = dict(sess_state or {})
-
-        message_text = ""
-        message_files_info: List[Tuple[Optional[Path], str]] = []
-
-        if isinstance(user_msg, dict):
-            message_text = (user_msg.get("text") or "").strip()
-            for raw_entry in user_msg.get("files") or []:
-                path, display_name = normalize_uploaded_entry(raw_entry)
-                if not path and not display_name:
-                    continue
-                message_files_info.append((path, display_name or "(file)"))
-        else:
-            message_text = str(user_msg or "").strip()
-
-        if not message_text and not message_files_info:
-            conv_history.append({"role": "assistant", "content": "⚠️ Please enter a message or attach files."})
-            yield conv_history, empty_chat_input(), conv_state, sess_state
-            return
-
-        user_display_parts: List[str] = []
-        if message_text:
-            user_display_parts.append(message_text)
-        if message_files_info:
-            filenames = ", ".join(display for _, display in message_files_info)
-            user_display_parts.append(f"📎 Files: {filenames}")
-        if not user_display_parts:
-            user_display_parts.append("(no message provided)")
-
-        conv_history.append({"role": "user", "content": "\n\n".join(user_display_parts)})
-
-        missing_files = [
-            display
-            for path, display in message_files_info
-            if (path is None) or (path and not path.exists())
-        ]
-        if missing_files:
-            conv_history.append({
-                "role": "assistant",
-                "content": f"⚠️ Skipping missing file(s): {', '.join(missing_files)}"
-            })
-
-        attachments_to_process = [path for path, _ in message_files_info if path and path.exists()]
-        if message_files_info and sess_state.get("work_dir"):
-            warning = (
-                "⚠️ New file uploads are ignored after the first message. Clear the chat to start a "
-                "fresh session if you need to provide different files."
-            )
-            conv_history.append({"role": "assistant", "content": warning})
-            attachments_to_process = []
-            attachments_to_process = []
-
-        conv_history.append({"role": "assistant", "content": "⏳ Preparing request…"})
-
-        yield conv_history, empty_chat_input(), conv_state, sess_state
-
-        try:
-            inference = infer(message_text, attachments_to_process, create_zip, conv_state, sess_state)
-            updated_history = conv_state
-            updated_session_state = sess_state
-
-            for update in inference:
-                update_type = update.get("type")
-                if update_type == "progress":
-                    conv_history[-1]["content"] = update.get("message", "")
-                    updated_session_state = update.get("session_state", updated_session_state)
-                    yield conv_history, empty_chat_input(), updated_history, updated_session_state
-                elif update_type == "final":
-                    conv_history[-1]["content"] = update.get("message", "")
-                    updated_history = update.get("conversation_history", updated_history)
-                    updated_session_state = update.get("session_state", updated_session_state)
-                    bundle_path = update.get("zip_path")
-                    if bundle_path:
-                        bundle = Path(bundle_path)
-                        if bundle.exists():
-                            try:
-                                conv_history.append({
-                                    "role": "assistant",
-                                    "content": gr.File(value=str(bundle), label="Download generated bundle")
-                                })
-                            except Exception as exc:  # pylint: disable=broad-except
-                                logger.warning("Failed to attach bundle to chat: %s", exc)
-                                conv_history.append({
-                                    "role": "assistant",
-                                    "content": f"Download bundle: {bundle.as_posix()}"
-                                })
-                        else:
-                            conv_history.append({
-                                "role": "assistant",
-                                "content": f"Bundle missing on disk: {bundle.as_posix()}"
-                            })
-                    yield conv_history, empty_chat_input(), updated_history, updated_session_state
-                    return
-
-            conv_history[-1]["content"] = "❌ Inference interrupted unexpectedly."
-            yield conv_history, empty_chat_input(), updated_history, updated_session_state
-
-        except Exception as exc:
-            logger.error(f"send_message failed: {exc}", exc_info=True)
-            conv_history[-1]["content"] = f"❌ Error: {exc}"
-            yield conv_history, empty_chat_input(), conv_state, sess_state
-
-    def clear_chat():
-        return [], empty_chat_input(), [], {}
-
-    send_btn.click(
-        send_message,
-        inputs=[message_input, create_zip, chatbot, conversation_state, session_state],
-        outputs=[chatbot, message_input, conversation_state, session_state]
-    )
-
-    message_input.submit(
-        send_message,
-        inputs=[message_input, create_zip, chatbot, conversation_state, session_state],
-        outputs=[chatbot, message_input, conversation_state, session_state]
-    )
-
-    clear_btn.click(
-        clear_chat,
-        outputs=[chatbot, message_input, conversation_state, session_state]
+    gr.ChatInterface(
+        fn=chat_handler,
+        type="messages",
+        multimodal=True,
+        save_history=True,
+        chatbot=gr.Chatbot(
+            label="💬 Conversation",
+            height=480,
+            type="messages",
+            value=[{"role": "assistant", "content": INITIAL_ASSISTANT_MESSAGE}]
+        ),
+        textbox=gr.MultimodalTextbox(
+            label="Your Request (files optional)",
+            placeholder="Describe what to test and optionally attach context files…",
+            file_count="multiple",
+            sources=["upload"],
+            file_types=["file"]
+        ),
+        additional_inputs=[create_zip_checkbox, conversation_state, session_state],
+        additional_outputs=[conversation_state, session_state],
+        description="Use the paperclip icon to attach supporting context. Progress appears inline as the assistant works.",
+        cache_examples=False
     )
 
 if __name__ == "__main__":
