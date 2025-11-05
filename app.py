@@ -740,7 +740,10 @@ def save_llm_context(user_story: str, repo_files: List[Tuple[str, str]], uploade
 def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_bottom: str = "1in", 
                             margin_left: str = "1in", margin_right: str = "1in") -> Optional[Path]:
     """
-    Convert a Markdown file to PDF using pandoc with custom margins.
+    Convert a Markdown file to PDF with fallback strategy:
+    1. Try pandoc (if available)
+    2. Try markdown_pdf library (if available)
+    3. Fall back to markdown only (return None)
     
     Args:
         md_file_path: Path to the markdown file
@@ -750,34 +753,49 @@ def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_
         margin_right: Right margin (e.g., "1in", "2cm")
     
     Returns:
-        The PDF file path if successful, None otherwise.
+        The PDF file path if successful, None otherwise (markdown will be used as fallback).
     """
+    pdf_file_path = md_file_path.with_suffix('.pdf')
+    
+    # Strategy 1: Try pandoc
+    if shutil.which('pandoc'):
+        try:
+            cmd = [
+                'pandoc',
+                str(md_file_path),
+                '-o', str(pdf_file_path),
+                '-V', f'geometry:margin={margin_top}'  # pandoc uses this format for all margins at once
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                logger.info(f"Converted {md_file_path} to {pdf_file_path} using pandoc with margins: top={margin_top}, bottom={margin_bottom}, left={margin_left}, right={margin_right}")
+                return pdf_file_path
+            else:
+                logger.warning(f"pandoc conversion failed for {md_file_path}: {result.stderr}")
+        except Exception as e:
+            logger.warning(f"Error running pandoc on {md_file_path}: {e}")
+    else:
+        logger.debug("pandoc not found in PATH, skipping pandoc strategy")
+    
+    # Strategy 2: Try markdown_pdf library
     try:
-        pdf_file_path = md_file_path.with_suffix('.pdf')
-        
-        # Check if pandoc is installed
-        if not shutil.which('pandoc'):
-            logger.warning(f"pandoc not found in PATH. Skipping markdown to PDF conversion for {md_file_path}")
-            return None
-        
-        # Run pandoc command with margin settings
-        cmd = [
-            'pandoc',
-            str(md_file_path),
-            '-o', str(pdf_file_path),
-            '-V', f'geometry:margin={margin_top}'  # pandoc uses this format for all margins at once
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            logger.warning(f"pandoc conversion failed for {md_file_path}: {result.stderr}")
-            return None
-        
-        logger.info(f"Converted {md_file_path} to {pdf_file_path} with margins: top={margin_top}, bottom={margin_bottom}, left={margin_left}, right={margin_right}")
+        from markdown_pdf import MarkdownPdf, Section
+        md_content = md_file_path.read_text(encoding='utf-8')
+        pdf = MarkdownPdf(toc_level=0, optimize=True)
+        pdf.add_section(Section(md_content))
+        pdf.meta["title"] = md_file_path.stem
+        pdf.save(str(pdf_file_path))
+        logger.info(f"Converted {md_file_path} to {pdf_file_path} using markdown_pdf library")
         return pdf_file_path
+    except ImportError:
+        logger.debug("markdown_pdf library not installed, skipping markdown_pdf strategy")
     except Exception as e:
-        logger.warning(f"Error converting {md_file_path} to PDF: {e}")
-        return None
+        logger.warning(f"Error converting {md_file_path} to PDF with markdown_pdf: {e}")
+    
+    # Strategy 3: Fall back to markdown only
+    logger.info(f"Could not convert {md_file_path} to PDF (pandoc and markdown_pdf unavailable). Keeping markdown file only.")
+    return None
 
 
 def write_outputs_to_zip_from_workdir(result: Dict[str, Any], work_dir: Path, original_codebase_dir: Optional[Path] = None) -> Path:

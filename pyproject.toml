@@ -1,0 +1,16 @@
+[project]
+name = "user-story-test-generator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "google-genai>=1.48.0",
+    "gradio>=5.49.1",
+    "markdown-pdf>=1.10",
+    "openpyxl>=3.1.5",
+    "pandoc>=2.4",
+    "pathspec>=0.12.1",
+    "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+]

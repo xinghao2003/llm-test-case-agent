@@ -4,3 +4,5 @@ pathspec
 PyYAML
 python-dotenv
 pandoc
+openpyxl
+markdown-pdf
