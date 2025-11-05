@@ -9,7 +9,6 @@ dependencies = [
     "gradio>=5.49.1",
     "markdown-pdf>=1.10",
     "openpyxl>=3.1.5",
-    "pandoc>=2.4",
     "pathspec>=0.12.1",
     "python-dotenv>=1.2.1",
     "pyyaml>=6.0.3",

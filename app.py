@@ -32,12 +32,12 @@ INITIAL_ASSISTANT_MESSAGE = (
 )
 
 SYSTEM_PROMPT = """\
-You are a senior QA engineer and software architect generating and improving automated test plans and code for a Python project.
+You are a senior QA engineer and software architect generating and improving automated test plans for a Python project.
 
 ## Goals
 1) Read and understand all provided context (PDFs, images, flattened repo text, and conversation history).
 2) Read and understand the user's current request/requirements.
-3) Use the available functions to create test files and supporting materials:
+3) Analyze the codebase and create comprehensive test materials:
    - Python pytest test code files under appropriate `tests/` paths.
    - Helper modules under `tests/utils/` if beneficial.
    - Comprehensive Markdown test specifications (e.g., `TEST_SPEC.md` or under `docs/`).
@@ -170,20 +170,51 @@ Checking that after entering the correct username and password, the user can suc
 | ---------------- | ----------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------- | ---------------------- | --------------- |
 | 1                | 1. Enter Username<br>2. Enter Password<br>3. Click on Login | Username: `geeksforgeeks`<br>Password: `geek123` | "Welcome to GeeksforGeeks!" message appears | Execution pending      | No issues found |
 
+## Summary Output Format
+After generating test files, provide a structured summary that includes:
+
+1. **What Was Done**
+   - List modules/features tested.
+   - Name the files created (e.g., `tests/test_auth.py`, `TEST_SPEC.md`).
+   - Describe the type of tests added (unit, integration, e2e, etc.).
+
+2. **Why It Was Done**
+   - Explain the business/technical rationale for each test suite.
+   - Link tests to specific requirements or risks identified in the codebase.
+   - Highlight critical paths or high-priority features covered.
+
+3. **Test Coverage**
+   - Summarize which functions, classes, or workflows are tested.
+   - List the number of test cases per module.
+   - Identify positive (happy path) vs. negative (error) test scenarios included.
+
+4. **Gaps & Limitations**
+   - Document what is NOT tested and why (e.g., external API mocks, environment-specific behaviors).
+   - Note any assumptions made or areas requiring manual testing.
+   - Mention known limitations of the pytest suite (e.g., no performance testing, no UI testing).
+
+5. **Usage Instructions**
+   - How to run the full test suite: `pytest tests/`
+   - How to run specific test files or modules: `pytest tests/test_auth.py -v`
+   - Any required setup (environment variables, test data, fixtures).
+   - How to generate a coverage report: `pytest --cov=<module> tests/`
+
 ## Process
 1) Review conversation history to understand what has been generated previously.
 2) Summarize the repo: key modules, public APIs (if detectable), and how they relate to the current request.
 3) For initial requests: Generate comprehensive test scenarios and cases in NEW files only.
 4) For improvement requests: Only create additional test files; never modify original application code.
 5) Use function calls to create new files.
-6) Provide a summary of what was done in your final response.
+6) Provide a structured summary following the **Summary Output Format** above instead of embedding code.
+7) Do NOT include code snippets or detailed source code in your summary response.
 
 ## Constraints
 - Call the `create_or_edit_file` function to persist **new test and documentation files only**.
-- Always provide the complete file content (not diffs or patches).
+- Always provide the complete file content to the function (not diffs or patches).
 - Use parallel function calls when creating multiple independent files.
 - Reference previous iterations when making improvements.
 - **NEVER edit application source code files. Only create new test files.**
+- **In your final summary message, focus on explaining WHAT, WHY, COVERAGE, GAPS, and USAGE—not the code itself.**
 """
 
 
@@ -740,10 +771,7 @@ def save_llm_context(user_story: str, repo_files: List[Tuple[str, str]], uploade
 def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_bottom: str = "1in", 
                             margin_left: str = "1in", margin_right: str = "1in") -> Optional[Path]:
     """
-    Convert a Markdown file to PDF with fallback strategy:
-    1. Try pandoc (if available)
-    2. Try markdown_pdf library (if available)
-    3. Fall back to markdown only (return None)
+    Convert a Markdown file to PDF using markdown-pdf library.
     
     Args:
         md_file_path: Path to the markdown file
@@ -757,28 +785,6 @@ def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_
     """
     pdf_file_path = md_file_path.with_suffix('.pdf')
     
-    # Strategy 1: Try pandoc
-    if shutil.which('pandoc'):
-        try:
-            cmd = [
-                'pandoc',
-                str(md_file_path),
-                '-o', str(pdf_file_path),
-                '-V', f'geometry:margin={margin_top}'  # pandoc uses this format for all margins at once
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode == 0:
-                logger.info(f"Converted {md_file_path} to {pdf_file_path} using pandoc with margins: top={margin_top}, bottom={margin_bottom}, left={margin_left}, right={margin_right}")
-                return pdf_file_path
-            else:
-                logger.warning(f"pandoc conversion failed for {md_file_path}: {result.stderr}")
-        except Exception as e:
-            logger.warning(f"Error running pandoc on {md_file_path}: {e}")
-    else:
-        logger.debug("pandoc not found in PATH, skipping pandoc strategy")
-    
-    # Strategy 2: Try markdown_pdf library
     try:
         from markdown_pdf import MarkdownPdf, Section
         md_content = md_file_path.read_text(encoding='utf-8')
@@ -789,12 +795,12 @@ def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_
         logger.info(f"Converted {md_file_path} to {pdf_file_path} using markdown_pdf library")
         return pdf_file_path
     except ImportError:
-        logger.debug("markdown_pdf library not installed, skipping markdown_pdf strategy")
+        logger.debug("markdown_pdf library not installed, skipping PDF conversion")
     except Exception as e:
         logger.warning(f"Error converting {md_file_path} to PDF with markdown_pdf: {e}")
     
-    # Strategy 3: Fall back to markdown only
-    logger.info(f"Could not convert {md_file_path} to PDF (pandoc and markdown_pdf unavailable). Keeping markdown file only.")
+    # Fall back to markdown only
+    logger.info(f"Could not convert {md_file_path} to PDF. Keeping markdown file only.")
     return None
 
 
@@ -1113,11 +1119,16 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
             for result in created_files
         ]
 
-        # Add assistant's last content and tool responses
+        # Add assistant's last content with explicit role
         if last_content is not None:
-            contents.append(last_content)
+            # Ensure the content has role="model" (Gemini uses "model" not "assistant")
+            assistant_content = types.Content(role="model", parts=last_content.parts if hasattr(last_content, 'parts') else [])
+            contents.append(assistant_content)
         else:
-            contents.append(types.Content(role="assistant", parts=[]))
+            # Add empty model response if none exists
+            contents.append(types.Content(role="model", parts=[]))
+        
+        # Add tool responses from user
         contents.append(types.Content(role="user", parts=tool_parts))
 
         # Get final summary from model

@@ -5,8 +5,19 @@ Minimal Gradio application that uses an LLM-driven, agentic workflow to turn use
 ## Quick Start
 
 1. `pip install -r requirements.txt`
-2. Copy `.env.example` to `.env` and populate `GOOGLE_API_KEY` plus any optional `GEMINI_*` tweaks.
+2. Rename `.env.example` to `.env` and populate `GOOGLE_API_KEY` plus any optional `GEMINI_*` tweaks.
 3. Run `python app.py` and open the served URL.
+
+## PDF Generation
+
+This application uses the **markdown-pdf** library to convert Markdown test specifications to PDF. The library is included in the requirements.txt and will be installed automatically.
+
+## UV Installation (Alternative)
+
+If you prefer using [uv](https://docs.astral.sh/uv/getting-started/installation/), install it first, then:
+
+1. `uv add -r requirements.txt`
+2. `uv app.py`
 
 ## Current Capabilities
 
