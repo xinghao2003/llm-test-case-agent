@@ -27,9 +27,8 @@ MAX_TOTAL_TEXT = 250_000
 ALLOWED_EXTENSIONS = {".zip", ".txt", ".md", ".pdf", ".jpg", ".jpeg", ".png"}
 
 INITIAL_ASSISTANT_MESSAGE = (
-    "📎 **Tip:** Attach your codebase ZIP, PDFs, images, or text files via the paperclip icon in your first "
-    "message. Describe the tests you need and continue chatting to iterate. Clear the chat to start over with "
-    "different files."
+    "Hi! I'm your test generator assistant. Attach your codebase (ZIP), documentation (PDF), or images, "
+    "then describe what tests you need. I'll generate test specifications and code for you."
 )
 
 SYSTEM_PROMPT = """\
@@ -38,22 +37,27 @@ You are a senior QA engineer and software architect generating and improving aut
 ## Goals
 1) Read and understand all provided context (PDFs, images, flattened repo text, and conversation history).
 2) Read and understand the user's current request/requirements.
-3) Use the available functions to CREATE or EDIT files:
+3) Use the available functions to create test files and supporting materials:
    - Python pytest test code files under appropriate `tests/` paths.
    - Helper modules under `tests/utils/` if beneficial.
    - Comprehensive Markdown test specifications (e.g., `TEST_SPEC.md` or under `docs/`).
-   - Application source files that need modification to support testing.
-4) Tests must be runnable with `pytest` out of the box (assume `pytest` only; no plugins unless absolutely needed).
-5) Prefer pure-std-lib where possible. If external deps are strictly necessary, note them in the spec file.
-6) Ensure meaningful file paths (POSIX-style), consistent naming, and idempotent generation.
-7) Include minimal fixtures, parametrization, and positive/negative cases where it helps coverage.
+   - Configuration files or auxiliary files that support testing (e.g., `conftest.py`, `pytest.ini`).
+   - When necessary for test integration, you may create or edit files in the original codebase (e.g., adding imports, fixtures, or pytest hooks).
+4) **PRIMARY FOCUS**: Prioritize creating new test files over editing existing source files. Only edit existing files when absolutely necessary for test framework integration.
+5) **IMPORTANT**: Do NOT fix bugs, syntax errors, or any issues in the original codebase that are unrelated to test execution. Focus exclusively on test generation. If you encounter bugs or errors in the codebase, document them in test specifications but do not attempt to fix them.
+6) Tests must be runnable with `pytest` out of the box (assume `pytest` only; no plugins unless absolutely needed).
+7) Prefer pure-std-lib where possible. If external deps are strictly necessary, note them in the spec file.
+8) Ensure meaningful file paths (POSIX-style), consistent naming, and idempotent generation.
+9) Include minimal fixtures, parametrization, and positive/negative cases where it helps coverage.
 
 ## Function Calling
-Use the `create_or_edit_file` function to create new files or edit existing ones. You can call this function multiple times in parallel for independent files.
+Use the `create_or_edit_file` function to create new files ONLY. You **cannot** edit existing files from the original codebase.
 
 When you need to:
-- **Create a new file**: Call `create_or_edit_file` with the full file path and complete content.
-- **Edit an existing file**: Call `create_or_edit_file` again with the file path and COMPLETE new content (full replacement).
+- **Create a new file**: Call `create_or_edit_file` with the full file path and complete content. 
+  - Allowed paths: `tests/**`, `docs/**`, `test_config/**`, `test_utils/**`, or similar new testing directories.
+  - **Do NOT** create or edit files in the main application source directories.
+- **Edit for testing support**: Only create new configuration or helper files; never modify application source code.
 - **Create multiple files**: Call `create_or_edit_file` multiple times in a single response for parallel execution.
 
 ## Content Requirements
@@ -64,10 +68,10 @@ When you need to:
   - Add docstrings explaining intent.
   - Where app APIs are unclear, stub interfaces using reasonable assumptions, with TODOs clearly marked.
   - Avoid environment-dependent operations unless explicitly described in context.
-- For edited files:
-  - Provide the COMPLETE file content, not partial updates.
-  - Maintain existing imports and structure unless changes are specifically requested.
-  - Preserve functionality not mentioned in the improvement request.
+- For new files:
+  - Provide the COMPLETE file content.
+  - Maintain consistency with the codebase style.
+  - Do not reference or depend on undocumented internal app APIs.
 
 ### TEST_SPEC.md Template Guidance
 When generating or editing `TEST_SPEC.md` (or similar Markdown specs), use the structure below. If specific details (for example, execution evidence or assigned tester) are unknown, populate the field with `TBD` rather than fabricating data.
@@ -169,16 +173,17 @@ Checking that after entering the correct username and password, the user can suc
 ## Process
 1) Review conversation history to understand what has been generated previously.
 2) Summarize the repo: key modules, public APIs (if detectable), and how they relate to the current request.
-3) For initial requests: Generate comprehensive test scenarios and cases.
-4) For improvement requests: Identify specific files to modify and generate updated complete content.
-5) Use function calls to create/edit files.
+3) For initial requests: Generate comprehensive test scenarios and cases in NEW files only.
+4) For improvement requests: Only create additional test files; never modify original application code.
+5) Use function calls to create new files.
 6) Provide a summary of what was done in your final response.
 
 ## Constraints
-- Call the `create_or_edit_file` function to persist files.
+- Call the `create_or_edit_file` function to persist **new test and documentation files only**.
 - Always provide the complete file content (not diffs or patches).
 - Use parallel function calls when creating multiple independent files.
 - Reference previous iterations when making improvements.
+- **NEVER edit application source code files. Only create new test files.**
 """
 
 
@@ -292,10 +297,25 @@ def get_file_creation_tool_definition() -> Dict[str, Any]:
         }
     }
 
-def execute_file_creation(file_path: str, content: str, description: str, work_dir: Path) -> Dict[str, Any]:
+def execute_file_creation(file_path: str, content: str, description: str, work_dir: Path, original_codebase_files: Optional[Set[str]] = None) -> Dict[str, Any]:
     try:
         normalized_path = file_path.replace("\\", "/").lstrip("/")
         target_path = work_dir / normalized_path
+        
+        # Log if editing a file from original codebase (advisory only, not blocked)
+        if original_codebase_files:
+            # Normalize the target path for comparison
+            path_parts = normalized_path.lower()
+            
+            # Check if file exists in original codebase
+            for orig_file in original_codebase_files:
+                if orig_file.lower() == path_parts or path_parts.endswith('/' + orig_file.lower()):
+                    logger.warning(
+                        f"Modifying original codebase file: {file_path}\n"
+                        f"Description: {description}"
+                    )
+                    break
+        
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content, encoding='utf-8')
         logger.info(f"File created/edited: {target_path}")
@@ -306,7 +326,7 @@ def execute_file_creation(file_path: str, content: str, description: str, work_d
             "description": description
         }
     except Exception as e:
-        logger.error(f"Error creating/editing file {file_path}: {e}", exc_info=True)
+        logger.error(f"Error creating file {file_path}: {e}", exc_info=True)
         return {"status": "error", "file_path": file_path, "message": str(e)}
 
 # ---------- Repo-to-Text (single, de-duplicated implementation) ----------
@@ -717,6 +737,49 @@ def save_llm_context(user_story: str, repo_files: List[Tuple[str, str]], uploade
     }
     return save_json_file(context_data, "context_logs", "llm_context")
 
+def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_bottom: str = "1in", 
+                            margin_left: str = "1in", margin_right: str = "1in") -> Optional[Path]:
+    """
+    Convert a Markdown file to PDF using pandoc with custom margins.
+    
+    Args:
+        md_file_path: Path to the markdown file
+        margin_top: Top margin (e.g., "1in", "2cm")
+        margin_bottom: Bottom margin (e.g., "1in", "2cm")
+        margin_left: Left margin (e.g., "1in", "2cm")
+        margin_right: Right margin (e.g., "1in", "2cm")
+    
+    Returns:
+        The PDF file path if successful, None otherwise.
+    """
+    try:
+        pdf_file_path = md_file_path.with_suffix('.pdf')
+        
+        # Check if pandoc is installed
+        if not shutil.which('pandoc'):
+            logger.warning(f"pandoc not found in PATH. Skipping markdown to PDF conversion for {md_file_path}")
+            return None
+        
+        # Run pandoc command with margin settings
+        cmd = [
+            'pandoc',
+            str(md_file_path),
+            '-o', str(pdf_file_path),
+            '-V', f'geometry:margin={margin_top}'  # pandoc uses this format for all margins at once
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            logger.warning(f"pandoc conversion failed for {md_file_path}: {result.stderr}")
+            return None
+        
+        logger.info(f"Converted {md_file_path} to {pdf_file_path} with margins: top={margin_top}, bottom={margin_bottom}, left={margin_left}, right={margin_right}")
+        return pdf_file_path
+    except Exception as e:
+        logger.warning(f"Error converting {md_file_path} to PDF: {e}")
+        return None
+
+
 def write_outputs_to_zip_from_workdir(result: Dict[str, Any], work_dir: Path, original_codebase_dir: Optional[Path] = None) -> Path:
     output_dir = ensure_dir(Path("results"))
     timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
@@ -750,6 +813,18 @@ def write_outputs_to_zip_from_workdir(result: Dict[str, Any], work_dir: Path, or
             logger.debug(f"Skipping generated file outside work dir: {file_path}")
             continue
         created_files[rel_path] = file_path
+
+    # Convert markdown files to PDF
+    files_to_remove: List[Path] = []  # Track PDF conversions for cleanup
+    for rel_path, abs_path in list(created_files.items()):
+        if abs_path.suffix.lower() == '.md':
+            pdf_path = convert_markdown_to_pdf(abs_path)
+            if pdf_path:
+                # Replace markdown with PDF in created_files
+                rel_pdf_path = rel_path.with_suffix('.pdf')
+                created_files[rel_pdf_path] = pdf_path
+                del created_files[rel_path]
+                files_to_remove.append(pdf_path)
 
     try:
         with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -871,7 +946,14 @@ def build_llm_request(
 
     return [types.Content(role='user', parts=user_parts)]
 
-def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path) -> Dict[str, Any]:
+def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path, original_codebase_files: Optional[Set[str]] = None):
+    """
+    Stream Gemini model responses with thoughts and tool calls.
+    Yields dictionaries with:
+    - type: 'thought' | 'tool_call' | 'tool_response' | 'text' | 'final'
+    - content: the actual content
+    - metadata: additional info for display
+    """
     file_tool = get_file_creation_tool_definition()
 
     def _extract_response_parts(resp):
@@ -891,70 +973,163 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path)
         system_instruction=SYSTEM_PROMPT
     )
 
-    response = client.models.generate_content(
+    created_files: List[Dict[str, Any]] = []
+    thinking_buffer = ""
+    thinking_message_id = "thinking"
+
+    # Stream the initial response
+    response_stream = client.models.generate_content_stream(
         model=get_model_name(),
         contents=contents,
         config=config
     )
 
-    created_files: List[Dict[str, Any]] = []
-    last_candidate_parts: List[Any] = []
-    last_text_candidate = None
-    while response:
-        candidate, assistant_content, assistant_parts = _extract_response_parts(response)
-        last_candidate_parts = assistant_parts
-        last_text_candidate = candidate
-        if candidate is None:
-            logger.warning("Gemini response had no candidates; stopping loop.")
-            break
+    last_candidate = None
+    last_content = None
+    accumulated_text = ""
 
-        new_tool_results: List[Dict[str, Any]] = []
+    for chunk in response_stream:
+        candidate, assistant_content, assistant_parts = _extract_response_parts(chunk)
+        last_candidate = candidate
+        last_content = assistant_content
+
+        if candidate is None:
+            continue
+
+        # Check for thinking content (if model has extended thinking)
         for part in assistant_parts:
+            # Stream thinking/reasoning
+            if hasattr(part, 'thought') and part.thought:
+                thinking_buffer += part.thought
+                yield {
+                    "type": "thought",
+                    "content": thinking_buffer,
+                    "metadata": {
+                        "title": "🤔 Analyzing requirements...",
+                        "id": thinking_message_id,
+                        "status": "pending"
+                    }
+                }
+
+            # Stream regular text
+            if getattr(part, "text", None):
+                accumulated_text += part.text
+                yield {
+                    "type": "text",
+                    "content": accumulated_text,
+                    "metadata": {}
+                }
+
+            # Handle function calls
             if getattr(part, "function_call", None):
                 fc = part.function_call
                 logger.info(f"Function call: {fc.name}")
+
                 if fc.name == "create_or_edit_file":
+                    file_path = fc.args.get("file_path", "")
+                    description = fc.args.get("description", "")
+
+                    # Show tool call
+                    yield {
+                        "type": "tool_call",
+                        "content": f"**File:** `{file_path}`\n**Purpose:** {description}",
+                        "metadata": {
+                            "title": f"🛠️ Creating: {file_path}",
+                            "id": f"tool_call_{len(created_files)}",
+                            "status": "pending"
+                        }
+                    }
+
+                    # Execute the tool with codebase file restrictions
                     result = execute_file_creation(
-                        file_path=fc.args.get("file_path", ""),
+                        file_path=file_path,
                         content=fc.args.get("content", ""),
-                        description=fc.args.get("description", ""),
-                        work_dir=work_dir
+                        description=description,
+                        work_dir=work_dir,
+                        original_codebase_files=original_codebase_files
                     )
                     created_files.append(result)
-                    new_tool_results.append(result)
-                else:
-                    logger.warning(f"Unsupported function call received: {fc.name}")
 
-        if new_tool_results:
-            # Send tool results back
-            tool_parts = [
-                types.Part.from_function_response(name="create_or_edit_file", response=r)
-                for r in new_tool_results
-            ]
-            if assistant_content is not None:
-                contents.append(assistant_content)
-            else:
-                contents.append(types.Content(role="assistant", parts=[]))
-            contents.append(types.Content(role="tool", parts=tool_parts))
-            response = client.models.generate_content(
-                model=get_model_name(),
-                contents=contents,
-                config=config
+                    # Show tool result
+                    if result.get("status") == "success":
+                        yield {
+                            "type": "tool_response",
+                            "content": f"✅ {result.get('message', 'File created successfully')}",
+                            "metadata": {
+                                "title": f"✅ Completed: {file_path}",
+                                "id": f"tool_result_{len(created_files)-1}",
+                                "status": "done"
+                            }
+                        }
+                    else:
+                        yield {
+                            "type": "tool_response",
+                            "content": f"❌ Error: {result.get('message', 'Unknown error')}",
+                            "metadata": {
+                                "title": f"❌ Failed: {file_path}",
+                                "id": f"tool_result_{len(created_files)-1}",
+                                "status": "done"
+                            }
+                        }
+
+    # Mark thinking as done if it was shown
+    if thinking_buffer:
+        yield {
+            "type": "thought",
+            "content": thinking_buffer,
+            "metadata": {
+                "title": "🤔 Analysis complete",
+                "id": thinking_message_id,
+                "status": "done"
+            }
+        }
+
+    # If there were function calls, continue the conversation
+    if created_files:
+        # Build tool response content
+        tool_parts = [
+            types.Part.from_function_response(
+                name="create_or_edit_file",
+                response=result
             )
-        else:
-            break
+            for result in created_files
+        ]
 
-    final_text = ""
-    for part in last_candidate_parts:
-        if getattr(part, "text", None):
-            final_text = part.text
-            break
-    if not final_text and last_text_candidate is not None:
-        finish_info = getattr(last_text_candidate, "finish_reason", "")
+        # Add assistant's last content and tool responses
+        if last_content is not None:
+            contents.append(last_content)
+        else:
+            contents.append(types.Content(role="assistant", parts=[]))
+        contents.append(types.Content(role="user", parts=tool_parts))
+
+        # Get final summary from model
+        final_stream = client.models.generate_content_stream(
+            model=get_model_name(),
+            contents=contents,
+            config=config
+        )
+
+        final_text = ""
+        for chunk in final_stream:
+            _, _, parts = _extract_response_parts(chunk)
+            for part in parts:
+                if getattr(part, "text", None):
+                    final_text += part.text
+                    yield {
+                        "type": "text",
+                        "content": final_text,
+                        "metadata": {}
+                    }
+
+    # Yield final result
+    final_text = accumulated_text if not created_files else final_text
+    if not final_text and last_candidate is not None:
+        finish_info = getattr(last_candidate, "finish_reason", "")
         if finish_info:
             final_text = f"[finish_reason: {finish_info}]"
 
-    return {
+    yield {
+        "type": "final",
         "status": "success",
         "created_files": created_files,
         "summary": final_text,
@@ -968,18 +1143,10 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
 
     progress_lines: List[str] = []
 
-    def emit_progress(line: Optional[str] = None, replace_last: bool = False) -> Dict[str, Any]:
-        if line is not None:
-            if replace_last and progress_lines:
-                progress_lines[-1] = line
-            else:
-                progress_lines.append(line)
-        return {
-            "type": "progress",
-            "message": "\n".join(progress_lines),
-            "conversation_history": conversation_history,
-            "session_state": session_state
-        }
+    def log_progress(line: str):
+        """Log progress to backend only, not shown in chat"""
+        progress_lines.append(line)
+        logger.info(line)
 
     sanitized_story = (user_story or "").strip()
     attachment_paths = [Path(p) for p in (attached_files or [])]
@@ -998,9 +1165,9 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
         sanitized_story = "User uploaded new context files. Continue processing with these artifacts."
 
     try:
-        yield emit_progress("🔌 Initializing Gemini client…")
+        log_progress("🔌 Initializing Gemini client…")
         client = create_gemini_client()
-        yield emit_progress("🔌 Gemini client ready ✅", replace_last=True)
+        log_progress("🔌 Gemini client ready ✅")
 
         repo_contents = session_state.get('repo_contents', [])
         uploaded_refs = session_state.get('uploaded_refs', [])
@@ -1008,31 +1175,35 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
         work_dir = Path(work_dir_path) if work_dir_path else None
         original_codebase_dir = session_state.get('original_codebase_dir')
         original_codebase_path = Path(original_codebase_dir) if original_codebase_dir else None
+        original_codebase_files = session_state.get('original_codebase_files', set())
         context_files: List[Path] = []
         zip_files: List[Path] = []
 
         if not session_state or work_dir is None:
             work_dir = Path(tempfile.mkdtemp(prefix="poc_ctx_"))
-            yield emit_progress("📥 Ingesting uploads…")
+            log_progress("📥 Ingesting uploads…")
             context_files, zip_files = process_uploads(attachment_paths, work_dir)
-            yield emit_progress("📥 Ingesting uploads ✅", replace_last=True)
+            log_progress("📥 Ingesting uploads ✅")
 
-            yield emit_progress("🧩 Flattening codebase (zip → text)…")
+            log_progress("🧩 Flattening codebase (zip → text)…")
             repo_contents = process_repositories(zip_files)
-            yield emit_progress("🧩 Flattening codebase (zip → text) ✅", replace_last=True)
+            log_progress("🧩 Flattening codebase (zip → text) ✅")
 
             original_codebase_path = None
+            original_codebase_files = set()
             if zip_files:
                 original_codebase_path = Path(tempfile.mkdtemp(prefix="codebase_"))
                 with zipfile.ZipFile(zip_files[0], 'r') as zf:
                     zf.extractall(original_codebase_path)
+                    # Track original file names for restriction checks
+                    original_codebase_files = set(zf.namelist())
 
-            yield emit_progress("☁️ Uploading context to Google Files…")
+            log_progress("☁️ Uploading context to Google Files…")
             uploaded_refs = [upload_file_to_gemini(client, f) for f in context_files] if context_files else []
             for file_path, _ in repo_contents:
                 flattened_ref = upload_path_to_gemini(client, Path(file_path), "text/plain")
                 uploaded_refs.append(flattened_ref)
-            yield emit_progress("☁️ Uploading context to Google Files ✅", replace_last=True)
+            log_progress("☁️ Uploading context to Google Files ✅")
 
             session_state = {
                 'session_id': session_id,
@@ -1040,53 +1211,71 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
                 'repo_contents': repo_contents,
                 'uploaded_refs': uploaded_refs,
                 'context_files': [str(f) for f in context_files],
-                'original_codebase_dir': str(original_codebase_path) if original_codebase_path else None
+                'original_codebase_dir': str(original_codebase_path) if original_codebase_path else None,
+                'original_codebase_files': list(original_codebase_files)
             }
             save_llm_context(sanitized_story, repo_contents, context_files)
         else:
             work_dir = Path(work_dir)
             original_codebase_path = Path(original_codebase_path) if original_codebase_path else None
+            original_codebase_files = set(session_state.get('original_codebase_files', []))
 
-        yield emit_progress("🤖 Calling LLM (with create_file tool)…")
+        log_progress("🤖 Calling LLM (with create_file tool)…")
         turn_start = time.time()
 
         contents = build_llm_request(sanitized_story, repo_contents, uploaded_refs, conversation_history)
-        result = call_gemini_model(client, contents, work_dir)
-        yield emit_progress("🤖 LLM response received ✅", replace_last=True)
 
-        yield emit_progress("☁️ Uploading newly created files to Google Files…")
+        # Stream the model responses - pass original codebase files for validation
+        result = None
+        for stream_update in call_gemini_model(client, contents, work_dir, original_codebase_files):
+            if stream_update.get("type") == "final":
+                result = stream_update
+            else:
+                update_type = stream_update.get("type", "")
+                if update_type in ["thought", "tool_call", "tool_response", "text"]:
+                    yield stream_update
+
+        log_progress("🤖 LLM response received ✅")
+
+        if result is None:
+            result = {
+                "status": "error",
+                "created_files": [],
+                "summary": "No response received from the model",
+                "total_files_created": 0
+            }
+
+        log_progress("☁️ Uploading newly created files to Google Files…")
         new_refs = collect_and_upload_created_files(client, work_dir, since_ts=turn_start)
         if new_refs:
             session_state.setdefault("uploaded_refs", []).extend(new_refs)
-        yield emit_progress("☁️ Uploading newly created files to Google Files ✅", replace_last=True)
+        log_progress("☁️ Uploading newly created files to Google Files ✅")
 
         save_json_file(result, "results", "function_call_result")
 
         zip_path: Optional[Path] = None
         if create_zip:
-            yield emit_progress("📦 Bundling ZIP (original + generated files)…")
+            log_progress("📦 Bundling ZIP (original + generated files)…")
             original_dir = session_state.get('original_codebase_dir')
             original_dir_path = Path(original_dir) if original_dir else None
             zip_path = write_outputs_to_zip_from_workdir(result, work_dir, original_dir_path)
-            yield emit_progress("📦 ZIP bundle ready ✅", replace_last=True)
+            log_progress("📦 ZIP bundle ready ✅")
 
         summary = result.get('summary', '')
         success_count = result.get('total_files_created', 0)
-        progress_lines.append(f"🗂️ {success_count} file(s) created/edited")
-        progress_lines.append("✅ Completed. See summary below." if summary else "✅ Completed.")
+        created_files = result.get('created_files', [])
 
         updated_history = conversation_history + [{
             'user': sanitized_story,
             'assistant_summary': (summary[:500] if summary else f"Created {success_count} files")
         }]
 
-        assistant_msg = "\n".join(progress_lines)
-        if summary:
-            assistant_msg += "\n\n" + summary
-
+        # Yield final result with summary, file list, and zip
         yield {
             "type": "final",
-            "message": assistant_msg,
+            "message": summary,
+            "created_files": created_files,
+            "total_files_created": success_count,
             "zip_path": str(zip_path) if zip_path else None,
             "conversation_history": updated_history,
             "session_state": session_state
@@ -1109,12 +1298,12 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
 def chat_handler(
     message: Any,
     history: List[Dict[str, Any]],
-    create_zip_opt: bool,
     conversation_state_value: List[Dict[str, Any]],
     session_state_value: Dict[str, Any]
 ):
     conv_state = list(conversation_state_value or [])
     sess_state = dict(session_state_value or {})
+    create_zip_opt = True  # Always create ZIP
 
     if isinstance(message, dict):
         message_dict = message
@@ -1155,67 +1344,155 @@ def chat_handler(
         yield "⚠️ Nothing to process yet. Provide instructions or new files.", conv_state, sess_state
         return
 
-    progress_msg = ChatMessage(
-        content="Initializing…",
-        metadata={"title": "_Processing_", "id": "progress", "status": "pending"}
-    )
-    yield progress_msg, conv_state, sess_state
-
     try:
         inference = infer(sanitized_story, attachments_to_process, bool(create_zip_opt), conv_state, sess_state)
         current_conv = conv_state
         current_session = sess_state
 
+        # Accumulate ALL messages in a list
+        all_messages = []
+        streaming_summary_index = None  # Track which message is the streaming summary
+
         for update in inference:
             update_type = update.get("type")
             current_session = update.get("session_state", current_session)
             current_conv = update.get("conversation_history", current_conv)
-            content = update.get("message", "")
 
-            if update_type == "progress":
-                progress_msg.content = content
-                progress_msg.metadata["log"] = content
-                progress_msg.metadata["status"] = "pending"
-                yield progress_msg, current_conv, current_session
+            if update_type == "thought":
+                # Add model's thinking as collapsible
+                content = update.get("content", "")
+                metadata = update.get("metadata", {})
+                thought_msg = ChatMessage(
+                    role="assistant",
+                    content=content,
+                    metadata=metadata
+                )
+                all_messages.append(thought_msg)
+                # Yield the accumulated list so far
+                yield all_messages, current_conv, current_session
+
+            elif update_type == "tool_call":
+                # Add tool call as collapsible
+                content = update.get("content", "")
+                metadata = update.get("metadata", {})
+                tool_msg = ChatMessage(
+                    role="assistant",
+                    content=content,
+                    metadata=metadata
+                )
+                all_messages.append(tool_msg)
+                # Yield the accumulated list so far
+                yield all_messages, current_conv, current_session
+
+            elif update_type == "tool_response":
+                # Add tool result
+                content = update.get("content", "")
+                metadata = update.get("metadata", {})
+                result_msg = ChatMessage(
+                    role="assistant",
+                    content=content,
+                    metadata=metadata
+                )
+                all_messages.append(result_msg)
+                # Yield the accumulated list so far
+                yield all_messages, current_conv, current_session
+
+            elif update_type == "text":
+                # Stream the summary text
+                content = update.get("content", "")
+
+                if streaming_summary_index is None:
+                    # First chunk - create new message
+                    summary_msg = ChatMessage(
+                        role="assistant",
+                        content=content
+                    )
+                    all_messages.append(summary_msg)
+                    streaming_summary_index = len(all_messages) - 1
+                else:
+                    # Update existing message with new content
+                    all_messages[streaming_summary_index] = ChatMessage(
+                        role="assistant",
+                        content=content
+                    )
+
+                # Yield the accumulated list with streaming summary
+                yield all_messages, current_conv, current_session
+
             elif update_type == "final":
-                progress_msg.content = content
-                progress_msg.metadata["log"] = content
-                progress_msg.metadata["status"] = "done"
+                # Add summary only if it wasn't already streamed
+                summary = update.get("message", "")
+                if summary and streaming_summary_index is None:
+                    # Summary wasn't streamed, add it now
+                    all_messages.append(ChatMessage(
+                        role="assistant",
+                        content=summary
+                    ))
+                elif summary and streaming_summary_index is not None:
+                    # Summary was streamed, just ensure final content is correct
+                    all_messages[streaming_summary_index] = ChatMessage(
+                        role="assistant",
+                        content=summary
+                    )
 
-                yield progress_msg, current_conv, current_session
+                # Add created files list as separate message
+                created_files = update.get("created_files", [])
+                total_files = update.get("total_files_created", 0)
+                if created_files:
+                    files_list = []
+                    files_list.append(f"### 📁 Generated Files ({total_files})")
+                    files_list.append("")
+                    for file_info in created_files:
+                        if file_info.get("status") == "success":
+                            path = file_info.get("file_path", "")
+                            desc = file_info.get("description", "")
+                            files_list.append(f"✅ **{path}**")
+                            if desc:
+                                files_list.append(f"   *{desc}*")
+                            files_list.append("")
 
+                    all_messages.append(ChatMessage(
+                        role="assistant",
+                        content="\n".join(files_list)
+                    ))
+
+                # Add ZIP file attachment
                 bundle_path = update.get("zip_path")
                 if bundle_path:
                     bundle = Path(bundle_path)
                     if bundle.exists():
-                        yield gr.File(value=str(bundle), label="Download generated bundle"), current_conv, current_session
-                    else:
-                        yield f"Bundle missing on disk: {bundle.as_posix()}", current_conv, current_session
+                        all_messages.append(ChatMessage(
+                            role="assistant",
+                            content=gr.File(
+                                value=str(bundle),
+                                label="📦 Download Generated Bundle"
+                            )
+                        ))
+
+                # Yield final accumulated list
+                yield all_messages, current_conv, current_session
                 return
 
             sess_state = current_session
             conv_state = current_conv
 
-        progress_msg.content = "❌ Inference interrupted unexpectedly."
-        progress_msg.metadata["status"] = "done"
-        progress_msg.metadata["log"] = progress_msg.content
-        yield progress_msg, current_conv, current_session
+        # If loop completes without final message
+        all_messages.append(ChatMessage(
+            role="assistant",
+            content="❌ Inference interrupted unexpectedly."
+        ))
+        yield all_messages, current_conv, current_session
 
     except Exception as exc:
         logger.error("chat_handler failed: %s", exc, exc_info=True)
-        yield f"❌ Error: {exc}", conv_state, sess_state
+        all_messages.append(ChatMessage(
+            role="assistant",
+            content=f"❌ Error: {exc}"
+        ))
+        yield all_messages, conv_state, sess_state
 
 
 with gr.Blocks(css="footer {visibility: hidden}") as demo:
-    gr.Markdown(
-        "# 🧪 User Story Test Generator\n"
-        "Attach ZIPs/PDFs/images directly in chat → Generate test assets → Iterate to refine results\n\n"
-    )
-
-    create_zip_checkbox = gr.Checkbox(
-        label="📦 Bundle ZIP with original codebase + generated files",
-        value=True
-    )
     conversation_state = gr.State([])
     session_state = gr.State({})
 
@@ -1225,21 +1502,19 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
         multimodal=True,
         save_history=True,
         chatbot=gr.Chatbot(
-            label="💬 Conversation",
-            height=480,
+            label="Test Generator",
+            height=600,
             type="messages",
-            value=[{"role": "assistant", "content": INITIAL_ASSISTANT_MESSAGE}]
+            placeholder=INITIAL_ASSISTANT_MESSAGE  # Show as placeholder instead of initial message
         ),
         textbox=gr.MultimodalTextbox(
-            label="Your Request (files optional)",
-            placeholder="Describe what to test and optionally attach context files…",
+            placeholder="Describe your test requirements or attach files (ZIP, PDF, images)…",
             file_count="multiple",
             sources=["upload"],
             file_types=["file"]
         ),
-        additional_inputs=[create_zip_checkbox, conversation_state, session_state],
+        additional_inputs=[conversation_state, session_state],
         additional_outputs=[conversation_state, session_state],
-        description="Use the paperclip icon to attach supporting context. Progress appears inline as the assistant works.",
         cache_examples=False
     )
 

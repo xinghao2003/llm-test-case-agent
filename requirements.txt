@@ -3,3 +3,4 @@ gradio
 pathspec
 PyYAML
 python-dotenv
+pandoc
