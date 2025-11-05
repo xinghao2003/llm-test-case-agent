@@ -79,7 +79,7 @@ When generating or editing `TEST_SPEC.md` (or similar Markdown specs), use the s
 # **Test Case Specification Template**
 
 **Module Name:**
-**Test Case ID:**
+**Test Case Spec ID:**
 
 ---
 
