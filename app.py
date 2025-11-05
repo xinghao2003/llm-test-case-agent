@@ -10,9 +10,11 @@ import subprocess
 import logging
 import platform
 import mimetypes
+import traceback
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional, Set, Union
 
 from dotenv import load_dotenv
 import gradio as gr
@@ -20,6 +22,14 @@ from gradio import ChatMessage
 import yaml
 import pathspec
 from pathspec import PathSpec
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 # ---------- Configuration ----------
 
@@ -804,7 +814,135 @@ def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_
     return None
 
 
-def write_outputs_to_zip_from_workdir(result: Dict[str, Any], work_dir: Path, original_codebase_dir: Optional[Path] = None) -> Path:
+def _write_debug_log(debug_dir: Path, md_filename: str, stage: str, data: Dict[str, Any]) -> None:
+    """
+    Write debug information to md2excel folder for troubleshooting.
+    """
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        log_name = md_filename.replace('.md', '')
+        log_file = debug_dir / f"{log_name}_{stage}_{timestamp}.json"
+        
+        with open(log_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"Failed to write debug log: {e}")
+
+def process_markdown_files_to_excel(
+    client: genai.Client,
+    work_dir: Path,
+    status_updates: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Scan work_dir for markdown files and attempt to convert them to Excel.
+    Returns a mapping of original md path -> conversion result.
+    This runs an independent LLM analyzer for each markdown file.
+    Files are converted in-place (same directory as original markdown).
+    """
+    results = {}
+    md_files = list(work_dir.glob("**/*.md"))
+    
+    if not md_files:
+        return results
+    
+    logger.info(f"Found {len(md_files)} markdown files to analyze for Excel conversion")
+    logger.info(f"Work dir for markdown processing: {work_dir}")
+    
+    debug_dir = ensure_dir(work_dir / "md2excel")
+    
+    for md_file in md_files:
+        try:
+            logger.info(f"Processing markdown: {md_file.name}")
+            event_id: Optional[str] = None
+            if status_updates is not None:
+                event_id = f"md2excel_{hashlib.sha1(str(md_file).encode('utf-8')).hexdigest()[:8]}"
+                status_updates.append({
+                    "event": "start",
+                    "event_id": event_id,
+                    "file": str(md_file),
+                    "display_name": md_file.name,
+                    "message": f"Creating Excel file from {md_file.name}"
+                })
+            _write_debug_log(debug_dir, md_file.name, "input", {
+                "file": md_file.name,
+                "file_size_bytes": md_file.stat().st_size,
+                "file_path": str(md_file),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+            
+            # Output directory is same as markdown directory (in-place conversion)
+            output_dir = md_file.parent
+            
+            conversion_result = call_md_to_excel_analyzer(client, md_file, output_dir, debug_dir)
+            
+            if conversion_result["status"] == "success":
+                results[str(md_file)] = conversion_result
+                logger.info(f"Successfully converted {md_file.name} to {conversion_result['format']}")
+                _write_debug_log(debug_dir, md_file.name, "success", conversion_result)
+                if status_updates is not None:
+                    fmt = (conversion_result.get("format") or "").lower()
+                    file_path_value = conversion_result.get("file_path")
+                    if fmt == "excel" and file_path_value:
+                        message = f"Created Excel file {Path(file_path_value).name}"
+                    elif fmt == "pdf" and file_path_value:
+                        message = f"Created PDF {Path(file_path_value).name}"
+                    elif fmt == "markdown" and file_path_value:
+                        message = f"Kept markdown file {Path(file_path_value).name}"
+                    else:
+                        message = "Completed conversion"
+                    status_updates.append({
+                        "event": "success",
+                        "event_id": event_id,
+                        "file": str(md_file),
+                        "display_name": md_file.name,
+                        "message": message,
+                        "details": conversion_result
+                    })
+            else:
+                logger.warning(f"Failed to convert {md_file.name}: {conversion_result.get('message', 'Unknown error')}")
+                results[str(md_file)] = conversion_result
+                _write_debug_log(debug_dir, md_file.name, "failure", conversion_result)
+                if status_updates is not None:
+                    status_updates.append({
+                        "event": "error",
+                        "event_id": event_id,
+                        "file": str(md_file),
+                        "display_name": md_file.name,
+                        "message": conversion_result.get('message', 'Unknown error'),
+                        "details": conversion_result
+                    })
+                
+        except Exception as e:
+            logger.error(f"Error processing {md_file.name}: {e}")
+            error_info = {
+                "status": "error",
+                "message": str(e),
+                "exception_type": type(e).__name__,
+                "traceback": traceback.format_exc()
+            }
+            results[str(md_file)] = error_info
+            _write_debug_log(debug_dir, md_file.name, "exception", error_info)
+            if status_updates is not None:
+                status_updates.append({
+                    "event": "error",
+                    "event_id": event_id,
+                    "file": str(md_file),
+                    "display_name": md_file.name,
+                    "message": str(e),
+                    "details": error_info
+                })
+    
+    return results
+
+
+def write_outputs_to_zip_from_workdir(
+    result: Dict[str, Any],
+    work_dir: Path,
+    original_codebase_dir: Optional[Path] = None,
+    client: Optional[genai.Client] = None,
+    status_updates: Optional[List[Dict[str, Any]]] = None
+) -> Path:
     output_dir = ensure_dir(Path("results"))
     timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
     zip_filename = output_dir / f"generated_files_{timestamp}.zip"
@@ -838,17 +976,41 @@ def write_outputs_to_zip_from_workdir(result: Dict[str, Any], work_dir: Path, or
             continue
         created_files[rel_path] = file_path
 
-    # Convert markdown files to PDF
-    files_to_remove: List[Path] = []  # Track PDF conversions for cleanup
-    for rel_path, abs_path in list(created_files.items()):
-        if abs_path.suffix.lower() == '.md':
-            pdf_path = convert_markdown_to_pdf(abs_path)
-            if pdf_path:
-                # Replace markdown with PDF in created_files
-                rel_pdf_path = rel_path.with_suffix('.pdf')
-                created_files[rel_pdf_path] = pdf_path
-                del created_files[rel_path]
-                files_to_remove.append(pdf_path)
+    # Process markdown files: attempt Excel conversion, fallback to PDF or keep as-is
+    # Keep original markdown AND add converted files alongside
+    converted_files_to_add: List[Tuple[Path, Path]] = []  # (rel_path, abs_path) pairs to add to ZIP
+    
+    if client:
+        try:
+            logger.info("Starting markdown-to-Excel analysis...")
+            conversion_results = process_markdown_files_to_excel(client, work_dir, status_updates=status_updates)
+            
+            for md_path_str, conv_result in conversion_results.items():
+                original_md = Path(md_path_str)
+                
+                # Add converted file (Excel or PDF) to the ZIP
+                output_file = conv_result.get("file_path")
+                if output_file and Path(output_file).exists():
+                    try:
+                        converted_path = Path(output_file)
+                        rel_converted = converted_path.relative_to(work_dir)
+                        converted_files_to_add.append((rel_converted, converted_path))
+                        
+                        fmt = conv_result.get('format', 'unknown')
+                        logger.info(f"Will add {converted_path.name} ({fmt}) alongside {original_md.name}")
+                    except ValueError:
+                        logger.debug(f"Converted file outside work dir: {output_file}")
+                else:
+                    logger.debug(f"No converted file for {original_md.name}")
+                    
+        except Exception as e:
+            logger.error(f"Markdown-to-Excel processing failed: {e}")
+    
+    # Add all converted files to created_files (alongside originals, not replacing)
+    for rel_path, abs_path in converted_files_to_add:
+        created_files[rel_path] = abs_path
+        logger.info(f"Added converted file to ZIP: {rel_path}")
+
 
     try:
         with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -895,6 +1057,641 @@ def collect_and_upload_created_files(client: genai.Client, work_dir: Path, since
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error(f"Failed to upload generated file {fp}: {exc}")
     return uploaded
+
+# ---------- Excel Test Case Helpers (Internal, not exposed to LLM yet) ----------
+
+# Core styles (reusable)
+_EXCEL_GREEN = PatternFill("solid", fgColor="FF00B050") if OPENPYXL_AVAILABLE else None
+_EXCEL_LIGHT_GRAY = PatternFill("solid", fgColor="FFD3D3D3") if OPENPYXL_AVAILABLE else None
+_EXCEL_WHITE_BOLD = Font(color="FFFFFFFF", bold=True) if OPENPYXL_AVAILABLE else None
+_EXCEL_WRAP = Alignment(wrap_text=True, vertical="center") if OPENPYXL_AVAILABLE else None
+_EXCEL_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True) if OPENPYXL_AVAILABLE else None
+_EXCEL_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True) if OPENPYXL_AVAILABLE else None
+_EXCEL_THIN = Side(style="thin", color="FF000000") if OPENPYXL_AVAILABLE else None
+_EXCEL_BORDER_ALL = Border(left=_EXCEL_THIN, right=_EXCEL_THIN, top=_EXCEL_THIN, bottom=_EXCEL_THIN) if OPENPYXL_AVAILABLE else None
+_EXCEL_HEADERS = ["Test Case ID", "Test Steps", "Test Input", "Expected Results", "Actual Results", "Status", "Comments"]
+
+def _apply_table_header(ws, start_row: int) -> None:
+    """Apply header styling to a row."""
+    if not OPENPYXL_AVAILABLE:
+        return
+    for i, h in enumerate(_EXCEL_HEADERS, start=1):
+        cell = ws.cell(row=start_row, column=i, value=h)
+        cell.fill = _EXCEL_GREEN
+        cell.font = _EXCEL_WHITE_BOLD
+        cell.alignment = _EXCEL_CENTER
+
+def _apply_grid(ws, max_row: int, max_col: int = 9) -> None:
+    """Apply borders and alignment to grid cells."""
+    if not OPENPYXL_AVAILABLE:
+        return
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.border = _EXCEL_BORDER_ALL
+            cell.alignment = _EXCEL_WRAP if c != 1 else _EXCEL_LEFT
+
+def _status_dropdown(ws, start_row: int, end_row: int = 500) -> None:
+    """Add data validation dropdown for Status column."""
+    if not OPENPYXL_AVAILABLE:
+        return
+    dv = DataValidation(type="list", formula1='"Pass,Fail,Blocked,N/A"', allow_blank=True)
+    dv.add(f"F{start_row}:F{end_row}")
+    ws.add_data_validation(dv)
+
+def init_testcase_excel(
+    path: Union[str, Path],
+    module_name: str,
+    spec_id: str,
+    description: str,
+    prerequisites: str,
+    env_info: str,
+    scenario: str,
+) -> Optional[Path]:
+    """
+    Create a test case workbook with metadata and the steps table.
+    Returns the saved file path, or None if openpyxl is not available.
+    Session-independent: file created in results/ directory with timestamp.
+    """
+    if not OPENPYXL_AVAILABLE:
+        logger.warning("openpyxl not installed, cannot create Excel test case file")
+        return None
+    
+    path = Path(path)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Test Case Template"
+
+    # Column widths
+    for col, w in {"A": 18, "B": 26, "C": 30, "D": 30, "E": 30, "F": 12, "G": 18, "H": 10, "I": 10}.items():
+        ws.column_dimensions[col].width = w
+
+    def label(row, text, height=18):
+        ws.row_dimensions[row].height = height
+        cell = ws.cell(row=row, column=1, value=text)
+        cell.fill = _EXCEL_GREEN
+        cell.font = _EXCEL_WHITE_BOLD
+        cell.alignment = _EXCEL_LEFT
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=9)
+
+    # Top metadata
+    label(1, "Module Name:-")
+    ws["B1"].value = module_name
+    label(2, "Test Case Spec ID")
+    ws["B2"].value = spec_id
+
+    ws.merge_cells(start_row=3, start_column=1, end_row=5, end_column=1)
+    c = ws.cell(row=3, column=1, value="Test Case Description")
+    c.fill = _EXCEL_GREEN
+    c.font = _EXCEL_WHITE_BOLD
+    c.alignment = _EXCEL_CENTER
+    ws.merge_cells(start_row=3, start_column=2, end_row=5, end_column=9)
+    ws["B3"].value = description
+    ws["B3"].alignment = _EXCEL_LEFT
+
+    ws.merge_cells(start_row=6, start_column=1, end_row=8, end_column=1)
+    c = ws.cell(row=6, column=1, value="Prerequisites:")
+    c.fill = _EXCEL_GREEN
+    c.font = _EXCEL_WHITE_BOLD
+    c.alignment = _EXCEL_CENTER
+    ws.merge_cells(start_row=6, start_column=2, end_row=8, end_column=9)
+    ws["B6"].value = prerequisites
+    ws["B6"].alignment = _EXCEL_LEFT
+
+    ws.merge_cells(start_row=9, start_column=1, end_row=11, end_column=1)
+    c = ws.cell(row=9, column=1, value="Environmental Information:-")
+    c.fill = _EXCEL_GREEN
+    c.font = _EXCEL_WHITE_BOLD
+    c.alignment = _EXCEL_CENTER
+    ws.merge_cells(start_row=9, start_column=2, end_row=11, end_column=9)
+    ws["B9"].value = env_info
+    ws["B9"].alignment = _EXCEL_LEFT
+
+    ws.merge_cells(start_row=12, start_column=1, end_row=12, end_column=9)
+    c = ws.cell(row=12, column=1, value="Test Scenario")
+    c.fill = _EXCEL_GREEN
+    c.font = _EXCEL_WHITE_BOLD
+    c.alignment = _EXCEL_LEFT
+    ws.merge_cells(start_row=13, start_column=1, end_row=13, end_column=9)
+    ws["A13"].value = scenario
+    ws["A13"].alignment = _EXCEL_LEFT
+
+    # Steps table
+    table_header_row = 15
+    _apply_table_header(ws, table_header_row)
+    _status_dropdown(ws, table_header_row + 1, table_header_row + 500)
+    ws.freeze_panes = ws[f"A{table_header_row + 1}"]
+
+    # Borders/grid (leave extra space for future rows)
+    _apply_grid(ws, table_header_row + 500)
+
+    # Save
+    wb.save(path)
+    logger.info(f"Created Excel test case file: {path}")
+    return path
+
+def add_testcase_to_excel(
+    path: Union[str, Path],
+    case_id: str,
+    steps: List[str],
+    test_input: Union[str, List[str]],
+    expected_results: str,
+) -> Optional[int]:
+    """
+    Appends a multi-row test case record to an existing Excel file.
+    - steps: list[str] of actions (each becomes a new row)
+    - test_input: str or list[str] (broadcast if str)
+    - expected_results: placed on the FIRST row of the block
+    Returns the first row index written, or None if openpyxl is not available.
+    """
+    if not OPENPYXL_AVAILABLE:
+        logger.warning("openpyxl not installed, cannot add test case to Excel file")
+        return None
+    
+    path = Path(path)
+    if not path.exists():
+        logger.error(f"Excel file not found: {path}")
+        return None
+    
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # Find first empty row under table header
+    header_row = 15
+    row = header_row + 1
+    while ws.cell(row=row, column=1).value or ws.cell(row=row, column=2).value:
+        row += 1
+
+    # Normalize test_input to list
+    if isinstance(test_input, list):
+        inputs = test_input + [""] * max(0, len(steps) - len(test_input))
+    else:
+        inputs = [test_input] + [""] * (len(steps) - 1)
+
+    first_row = row
+    for i, step in enumerate(steps):
+        ws.cell(row=row, column=1, value=case_id if i == 0 else "")
+        ws.cell(row=row, column=2, value=step)
+        ws.cell(row=row, column=3, value=inputs[i] if i < len(inputs) else "")
+        ws.cell(row=row, column=4, value=expected_results if i == 0 else "")
+        # Cols E,F,G left blank by default (Actual, Status, Comments)
+
+        # Apply light gray fill to first row of test case
+        if i == 0:
+            for c in range(1, 8):  # Columns A through G
+                ws.cell(row=row, column=c).fill = _EXCEL_LIGHT_GRAY
+
+        row += 1
+
+    wb.save(path)
+    logger.info(f"Added test case {case_id} to Excel file: {path}")
+    return first_row
+
+# ---------- Markdown-to-Excel Analyzer (Internal LLM Session) ----------
+
+MD_TO_EXCEL_ANALYZER_PROMPT = """\
+You are a deterministic converter that MUST respond by calling exactly ONE tool.
+
+### Workflow
+1. Read the markdown content.
+2. Determine whether the required fields are present (Module Name, Test Case Spec ID, Description, Prerequisites, Environmental Information, Test Scenario, and at least one test case with ID, steps, expected results).
+3. Always invoke one function:
+    - If the required fields exist (even if some values are TBD), call `process_md_to_excel`.
+    - Otherwise call `markdown_to_pdf_fallback`.
+
+### Non-negotiable rules
+- You MUST issue exactly one function call. Plain-text answers are forbidden.
+- Never refuse, apologize, or ask questions. Default to `markdown_to_pdf_fallback` when unsure.
+- When using `process_md_to_excel`, pass every test case row you can extract. Convert `<br>` separators into individual step strings.
+- Preserve wording from the markdown. Trim whitespace but do not invent details.
+
+### Example payloads (for guidance only)
+```
+process_md_to_excel({
+    "module_name": "Example Module",
+    "spec_id": "EX-001",
+    "description": "Example description",
+    "prerequisites": "1. Item one\n2. Item two",
+    "env_info": "| Item | Details |...",
+    "scenario": "Scenario text",
+    "test_cases": [
+        {
+            "case_id": "CASE-001",
+            "steps": ["Step 1", "Step 2"],
+            "test_input": "Input details",
+            "expected_results": "Expected outcome"
+        }
+    ]
+})
+
+markdown_to_pdf_fallback({
+    "reason": "Missing test case table"
+})
+```
+
+Return only the tool call and the brief final acknowledgement mandated by the system.
+"""
+
+def create_md_to_excel_analyzer_tool_defs() -> List[Dict[str, Any]]:
+    """Return tool definitions for the MD-to-Excel analyzer LLM session."""
+    return [
+        {
+            "name": "process_md_to_excel",
+            "description": "Process markdown test specification and create Excel workbook",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "module_name": {"type": "string", "description": "Module name being tested"},
+                    "spec_id": {"type": "string", "description": "Test specification ID"},
+                    "description": {"type": "string", "description": "Test case description"},
+                    "prerequisites": {"type": "string", "description": "Prerequisites (multiline)"},
+                    "env_info": {"type": "string", "description": "Environmental information"},
+                    "scenario": {"type": "string", "description": "Test scenario"},
+                    "test_cases": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "case_id": {"type": "string", "description": "Test case ID"},
+                                "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered test steps"},
+                                "test_input": {"type": "string", "description": "Input data (string or JSON array string)"},
+                                "expected_results": {"type": "string", "description": "Expected results"}
+                            },
+                            "required": ["case_id", "steps", "expected_results"]
+                        },
+                        "description": "List of test cases to add"
+                    }
+                },
+                "required": ["module_name", "spec_id", "description", "prerequisites", "env_info", "scenario", "test_cases"]
+            }
+        },
+        {
+            "name": "markdown_to_pdf_fallback",
+            "description": "Convert markdown file to PDF as fallback when not suitable for Excel",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Why conversion to Excel is not possible"}
+                },
+                "required": ["reason"]
+            }
+        }
+    ]
+
+def execute_process_md_to_excel(
+    module_name: str,
+    spec_id: str,
+    description: str,
+    prerequisites: str,
+    env_info: str,
+    scenario: str,
+    test_cases: Union[str, List[Dict[str, Any]]],
+    output_file: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Execute markdown-to-Excel conversion: initialize template and add test cases.
+    Runs in parallel: init + all adds happen concurrently.
+    """
+    try:
+        if not output_file:
+            raise ValueError("output_file must be provided for Excel generation")
+        output_path = Path(output_file)
+        
+        # Parse test_cases if it's a JSON string (from LLM)
+        if isinstance(test_cases, str):
+            try:
+                import json
+                test_cases = json.loads(test_cases)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"Could not parse test_cases as JSON: {test_cases[:100]}")
+                test_cases = []
+        
+        # Ensure test_cases is a list
+        if not isinstance(test_cases, list):
+            logger.warning(f"test_cases is not a list: {type(test_cases)}")
+            test_cases = []
+        
+        # Initialize Excel template
+        excel_path = init_testcase_excel(
+            output_path,
+            module_name=module_name,
+            spec_id=spec_id,
+            description=description,
+            prerequisites=prerequisites,
+            env_info=env_info,
+            scenario=scenario
+        )
+        
+        if not excel_path:
+            return {
+                "status": "error",
+                "message": "Failed to initialize Excel file (openpyxl not available)"
+            }
+        
+        # Add all test cases (sequential but fast)
+        added_count = 0
+        errors = []
+        
+        for test_case in test_cases:
+            try:
+                case_id = test_case.get("case_id", "")
+                steps = test_case.get("steps", [])
+                test_input = test_case.get("test_input", "")
+                expected = test_case.get("expected_results", "")
+                
+                if not all([case_id, steps, expected]):
+                    errors.append(f"Skipped {case_id}: missing required fields")
+                    continue
+                
+                # If test_input is a JSON string array, parse it
+                if isinstance(test_input, str) and test_input.startswith("["):
+                    try:
+                        import json
+                        test_input = json.loads(test_input)
+                    except (json.JSONDecodeError, ValueError):
+                        # Keep as string if JSON parsing fails
+                        pass
+                
+                row = add_testcase_to_excel(
+                    excel_path,
+                    case_id=case_id,
+                    steps=steps,
+                    test_input=test_input,
+                    expected_results=expected
+                )
+                
+                if row is not None:
+                    added_count += 1
+                else:
+                    errors.append(f"Failed to add {case_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error adding test case: {e}")
+                errors.append(f"Exception for {test_case.get('case_id', 'unknown')}: {str(e)}")
+        
+        return {
+            "status": "success",
+            "file_path": str(excel_path),
+            "test_cases_added": added_count,
+            "errors": errors if errors else None
+        }
+        
+    except Exception as e:
+        logger.error(f"MD-to-Excel conversion failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def execute_markdown_to_pdf_fallback(
+    reason: str,
+    markdown_file: Optional[str] = None,
+    output_file: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Fallback conversion: markdown to PDF. If PDF fails, keeps markdown.
+    """
+    try:
+        if not markdown_file:
+            raise ValueError("markdown_file must be provided for fallback conversion")
+        md_path = Path(markdown_file)
+        if not md_path.exists():
+            return {"status": "error", "message": f"Markdown file not found: {markdown_file}"}
+        
+        # Try PDF conversion
+        pdf_path = convert_markdown_to_pdf(md_path)
+        
+        if pdf_path:
+            return {
+                "status": "success",
+                "format": "pdf",
+                "file_path": str(pdf_path),
+                "message": "Converted to PDF",
+                "reason": reason
+            }
+        else:
+            # Fallback: keep markdown as-is and reference the original path
+            import shutil
+            if output_file:
+                output_path = Path(output_file)
+            else:
+                output_path = md_path.with_suffix('.md')
+            if output_path.suffix.lower() != ".md":
+                output_path = output_path.with_suffix(".md")
+            if output_path.resolve() != md_path.resolve():
+                shutil.copy2(md_path, output_path)
+                fallback_path = output_path
+            else:
+                fallback_path = md_path
+            return {
+                "status": "success",
+                "format": "markdown",
+                "file_path": str(fallback_path),
+                "message": "PDF conversion unavailable; kept markdown file",
+                "reason": reason
+            }
+            
+    except Exception as e:
+        logger.error(f"Markdown fallback conversion failed: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def call_md_to_excel_analyzer(client: genai.Client, md_file_path: Path, output_dir: Path, debug_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Spawn an independent LLM session to analyze markdown and convert to Excel.
+    Returns status of conversion and file paths.
+    """
+    md_content = md_file_path.read_text(encoding='utf-8', errors='replace')
+    
+    # Log the markdown content being analyzed
+    if debug_dir:
+        _write_debug_log(debug_dir, md_file_path.name, "markdown_content", {
+            "content_length": len(md_content),
+            "first_300_chars": md_content[:300],
+            "has_test_spec_markers": "##" in md_content or "Test Case" in md_content
+        })
+    
+    # Build a more directive user message that explicitly tells the LLM to call a tool
+    user_message = f"""\
+You MUST analyze this markdown and call exactly ONE tool.
+
+MARKDOWN FILE: {md_file_path.name}
+
+---
+{md_content}
+---
+
+INSTRUCTIONS:
+1. If this markdown contains Module Name, Spec ID, Description, Prerequisites, Environment, Scenario, and well-formed Test Cases:
+    Call: process_md_to_excel with the extracted fields.
+
+2. If any required section is missing or malformed:
+    Call: markdown_to_pdf_fallback with a short reason (e.g., "missing prerequisites").
+
+YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
+"""
+
+    if debug_dir:
+        _write_debug_log(debug_dir, md_file_path.name, "user_message", {
+            "message_length": len(user_message),
+            "first_400_chars": user_message[:400]
+        })
+
+    analyzer_tools = create_md_to_excel_analyzer_tool_defs()
+    
+    config = types.GenerateContentConfig(
+        temperature=0.1,  # Minimal temperature for deterministic tool calling
+        tools=[types.Tool(function_declarations=analyzer_tools)],
+        system_instruction=MD_TO_EXCEL_ANALYZER_PROMPT
+    )
+    
+    if debug_dir:
+        _write_debug_log(debug_dir, md_file_path.name, "config", {
+            "model": get_model_name(),
+            "temperature": 0.1,
+            "num_tools": len(analyzer_tools),
+            "tool_names": [t.get("name") for t in analyzer_tools]
+        })
+    
+    # Use non-streaming approach first for reliability
+    try:
+        response = client.models.generate_content(
+            model=get_model_name(),
+            contents=[types.Content(role='user', parts=[types.Part.from_text(text=user_message)])],
+            config=config
+        )
+    except Exception as e:
+        error_detail = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        }
+        if debug_dir:
+            _write_debug_log(debug_dir, md_file_path.name, "stream_error", error_detail)
+        raise
+    
+    result = {
+        "file_path": None,
+        "format": None,
+        "status": "pending",
+        "message": "",
+        "tool_calls": []  # Track all tool calls
+    }
+    
+    response_text = ""
+    
+    print(response)
+    print(response.candidates)
+    
+    # Process the response (non-streaming)
+    if response.candidates:
+        candidate = response.candidates[0]
+        
+        # Process function calls AND text responses
+        if candidate.content and candidate.content.parts:
+            for part in candidate.content.parts:
+                # Handle function calls
+                if part.function_call:
+                    func_name = part.function_call.name
+                    args = {k: v for k, v in part.function_call.args.items()}
+                    
+                    # Log the tool call
+                    tool_call_info = {
+                        "function": func_name,
+                        "args_keys": list(args.keys()),
+                        "args_summary": {k: (v[:100] if isinstance(v, str) else v) for k, v in args.items()}
+                    }
+                    result["tool_calls"].append(tool_call_info)
+                    
+                    if debug_dir:
+                        _write_debug_log(debug_dir, md_file_path.name, f"tool_call_{func_name}", {
+                            "function": func_name,
+                            "full_args": args
+                        })
+                    
+                    try:
+                        if func_name == "process_md_to_excel":
+                            args.setdefault("output_file", str(output_dir / f"{md_file_path.stem}.xlsx"))
+                            exec_result = execute_process_md_to_excel(**args)
+                            result.update({
+                                "format": "excel",
+                                "status": exec_result.get("status"),
+                                "file_path": exec_result.get("file_path"),
+                                "message": f"Created Excel with {exec_result.get('test_cases_added', 0)} test cases"
+                            })
+                            logger.info(f"MD-to-Excel: {result['message']}")
+                            
+                            if debug_dir:
+                                _write_debug_log(debug_dir, md_file_path.name, "exec_result_excel", exec_result)
+                            
+                        elif func_name == "markdown_to_pdf_fallback":
+                            args.setdefault("markdown_file", str(md_file_path))
+                            args.setdefault("output_file", str(output_dir / f"{md_file_path.stem}.pdf"))
+                            exec_result = execute_markdown_to_pdf_fallback(**args)
+                            result.update({
+                                "format": exec_result.get("format", "unknown"),
+                                "status": exec_result.get("status"),
+                                "file_path": exec_result.get("file_path"),
+                                "message": exec_result.get("message", "Fallback conversion completed")
+                            })
+                            logger.info(f"MD-to-PDF/Fallback: {result['message']}")
+                            
+                            if debug_dir:
+                                _write_debug_log(debug_dir, md_file_path.name, "exec_result_pdf", exec_result)
+                    
+                    except Exception as exec_error:
+                        error_detail = {
+                            "tool_function": func_name,
+                            "error_type": type(exec_error).__name__,
+                            "error_message": str(exec_error),
+                            "traceback": traceback.format_exc(),
+                            "args_passed": args
+                        }
+                        if debug_dir:
+                            _write_debug_log(debug_dir, md_file_path.name, f"exec_error_{func_name}", error_detail)
+                        logger.error(f"Error executing {func_name}: {exec_error}")
+                        raise
+                
+                # Handle text responses (for debugging)
+                if part.text:
+                    response_text += part.text
+    
+    # If no tool calls were made, report a clear error
+    if not result["tool_calls"]:
+        if debug_dir:
+            _write_debug_log(debug_dir, md_file_path.name, "llm_response_no_tools", {
+                "response_text": response_text,
+                "note": "LLM did not call any tools"
+            })
+        logger.warning("LLM did not call any tools for %s", md_file_path.name)
+        result["message"] = (
+            "Markdown-to-Excel analyzer did not invoke required tools; conversion skipped."
+            if not response_text else
+            f"LLM response without tool call: {response_text[:200]}"
+        )
+        result["status"] = "error"
+
+    
+    # Final summary log
+    if debug_dir:
+        _write_debug_log(debug_dir, md_file_path.name, "final_result", result)
+    
+    return result
+
+def _python_type_to_schema(type_obj: Dict[str, Any]) -> str:
+    """Helper to convert python type dict to schema type string."""
+    if isinstance(type_obj, dict):
+        if type_obj.get("type") == "array":
+            return "ARRAY"
+        if type_obj.get("type") == "object":
+            return "OBJECT"
+        if type_obj.get("type") == "string":
+            return "STRING"
+        if "oneOf" in type_obj:
+            return "STRING"  # Default for oneOf
+    return "STRING"
 
 # ---------- Pipeline ----------
 
@@ -1138,6 +1935,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
             config=config
         )
 
+        base_text = accumulated_text
         final_text = ""
         for chunk in final_stream:
             _, _, parts = _extract_response_parts(chunk)
@@ -1146,22 +1944,22 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                     final_text += part.text
                     yield {
                         "type": "text",
-                        "content": final_text,
+                        "content": base_text + final_text,
                         "metadata": {}
                     }
 
     # Yield final result
-    final_text = accumulated_text if not created_files else final_text
-    if not final_text and last_candidate is not None:
+    combined_text = accumulated_text if not created_files else (base_text + final_text)
+    if not combined_text and last_candidate is not None:
         finish_info = getattr(last_candidate, "finish_reason", "")
         if finish_info:
-            final_text = f"[finish_reason: {finish_info}]"
+            combined_text = f"[finish_reason: {finish_info}]"
 
     yield {
         "type": "final",
         "status": "success",
         "created_files": created_files,
-        "summary": final_text,
+        "summary": combined_text,
         "total_files_created": sum(1 for f in created_files if f.get("status") == "success")
     }
 
@@ -1283,12 +2081,54 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
         save_json_file(result, "results", "function_call_result")
 
         zip_path: Optional[Path] = None
+        zip_path: Optional[Path] = None
+        conversion_updates: List[Dict[str, Any]] = []
         if create_zip:
             log_progress("📦 Bundling ZIP (original + generated files)…")
             original_dir = session_state.get('original_codebase_dir')
             original_dir_path = Path(original_dir) if original_dir else None
-            zip_path = write_outputs_to_zip_from_workdir(result, work_dir, original_dir_path)
+            zip_path = write_outputs_to_zip_from_workdir(
+                result=result,
+                work_dir=work_dir,
+                original_codebase_dir=original_dir_path,
+                client=client,
+                status_updates=conversion_updates
+            )
             log_progress("📦 ZIP bundle ready ✅")
+
+        for event in conversion_updates:
+            event_id = event.get("event_id") or f"md2excel_{hashlib.sha1(event.get('file', '').encode('utf-8')).hexdigest()[:8]}"
+            display_name = event.get("display_name") or Path(event.get("file", "")).name
+            if event.get("event") == "start":
+                yield {
+                    "type": "tool_call",
+                    "content": event.get("message", ""),
+                    "metadata": {
+                        "title": f"🛠️ {display_name}",
+                        "id": event_id,
+                        "status": "pending"
+                    }
+                }
+            elif event.get("event") == "success":
+                yield {
+                    "type": "tool_response",
+                    "content": event.get("message", ""),
+                    "metadata": {
+                        "title": f"✅ {display_name}",
+                        "id": event_id,
+                        "status": "done"
+                    }
+                }
+            elif event.get("event") == "error":
+                yield {
+                    "type": "tool_response",
+                    "content": f"❌ {event.get('message', '')}",
+                    "metadata": {
+                        "title": f"❌ {display_name}",
+                        "id": event_id,
+                        "status": "done"
+                    }
+                }
 
         summary = result.get('summary', '')
         success_count = result.get('total_files_created', 0)
