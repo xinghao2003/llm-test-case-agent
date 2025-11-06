@@ -1250,38 +1250,40 @@ def add_testcase_to_excel(
 # ---------- Markdown-to-Excel Analyzer (Internal LLM Session) ----------
 
 MD_TO_EXCEL_ANALYZER_PROMPT = """\
-You are a deterministic converter that MUST respond by calling exactly ONE tool.
+You are a deterministic converter that MUST use the provided tools to transform markdown test specs.
 
 ### Workflow
 1. Read the markdown content.
 2. Determine whether the required fields are present (Module Name, Test Case Spec ID, Description, Prerequisites, Environmental Information, Test Scenario, and at least one test case with ID, steps, expected results).
-3. Always invoke one function:
-    - If the required fields exist (even if some values are TBD), call `process_md_to_excel`.
-    - Otherwise call `markdown_to_pdf_fallback`.
+3. If the required fields exist (even if some values are TBD):
+    a. Call `initialize_markdown_excel` once with the metadata fields.
+    b. Call `append_test_case_to_excel` separately for each test case row you can extract (one function call per test case).
+    c. After all tool calls complete, send a brief acknowledgement message.
+4. If the required fields are missing or malformed, call `markdown_to_pdf_fallback` with a short reason.
 
 ### Non-negotiable rules
-- You MUST issue exactly one function call. Plain-text answers are forbidden.
+- Always begin with a tool call; do not send free-form text before the first function call.
 - Never refuse, apologize, or ask questions. Default to `markdown_to_pdf_fallback` when unsure.
-- When using `process_md_to_excel`, pass every test case row you can extract. Convert `<br>` separators into individual step strings.
-- Preserve wording from the markdown. Trim whitespace but do not invent details.
+- When adding test cases, convert `<br>` separators into individual step strings, join them with newline characters, and preserve the source wording.
+- Provide `test_input` as a single string (use a JSON array string when multiple inputs are present).
+- Avoid inventing data. Trim whitespace only.
 
 ### Example payloads (for guidance only)
 ```
-process_md_to_excel({
+initialize_markdown_excel({
     "module_name": "Example Module",
     "spec_id": "EX-001",
     "description": "Example description",
-    "prerequisites": "1. Item one\n2. Item two",
-    "env_info": "| Item | Details |...",
-    "scenario": "Scenario text",
-    "test_cases": [
-        {
-            "case_id": "CASE-001",
-            "steps": ["Step 1", "Step 2"],
-            "test_input": "Input details",
-            "expected_results": "Expected outcome"
-        }
-    ]
+    "prerequisites": "1. Item one\\n2. Item two",
+    "env_info": "| Item | Details | ...",
+    "scenario": "Scenario text"
+})
+
+append_test_case_to_excel({
+    "case_id": "CASE-001",
+    "steps": ["Step 1", "Step 2"],
+    "test_input": "Input details",
+    "expected_results": "Expected outcome"
 })
 
 markdown_to_pdf_fallback({
@@ -1289,15 +1291,15 @@ markdown_to_pdf_fallback({
 })
 ```
 
-Return only the tool call and the brief final acknowledgement mandated by the system.
+Return tool calls (in order) followed by the brief acknowledgement mandated by the system.
 """
 
 def create_md_to_excel_analyzer_tool_defs() -> List[Dict[str, Any]]:
     """Return tool definitions for the MD-to-Excel analyzer LLM session."""
     return [
         {
-            "name": "process_md_to_excel",
-            "description": "Process markdown test specification and create Excel workbook",
+            "name": "initialize_markdown_excel",
+            "description": "Create or overwrite an Excel workbook using metadata parsed from markdown",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1307,22 +1309,30 @@ def create_md_to_excel_analyzer_tool_defs() -> List[Dict[str, Any]]:
                     "prerequisites": {"type": "string", "description": "Prerequisites (multiline)"},
                     "env_info": {"type": "string", "description": "Environmental information"},
                     "scenario": {"type": "string", "description": "Test scenario"},
-                    "test_cases": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "case_id": {"type": "string", "description": "Test case ID"},
-                                "steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered test steps"},
-                                "test_input": {"type": "string", "description": "Input data (string or JSON array string)"},
-                                "expected_results": {"type": "string", "description": "Expected results"}
-                            },
-                            "required": ["case_id", "steps", "expected_results"]
-                        },
-                        "description": "List of test cases to add"
-                    }
+                    "output_file": {"type": "string", "description": "Optional explicit Excel output path"}
                 },
-                "required": ["module_name", "spec_id", "description", "prerequisites", "env_info", "scenario", "test_cases"]
+                "required": ["module_name", "spec_id", "description", "prerequisites", "env_info", "scenario"]
+            }
+        },
+        {
+            "name": "append_test_case_to_excel",
+            "description": "Append a single test case row block to the Excel workbook",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "case_id": {"type": "string", "description": "Test case ID"},
+                    "steps": {
+                        "type": "string",
+                        "description": "Ordered test steps (use line breaks or `<br>` to separate steps)"
+                    },
+                    "test_input": {
+                        "type": "string",
+                        "description": "Input data (stringified value, JSON array string if multiple)"
+                    },
+                    "expected_results": {"type": "string", "description": "Expected results"},
+                    "excel_file": {"type": "string", "description": "Optional explicit Excel file path"}
+                },
+                "required": ["case_id", "steps", "expected_results"]
             }
         },
         {
@@ -1338,40 +1348,22 @@ def create_md_to_excel_analyzer_tool_defs() -> List[Dict[str, Any]]:
         }
     ]
 
-def execute_process_md_to_excel(
+def execute_initialize_markdown_excel(
     module_name: str,
     spec_id: str,
     description: str,
     prerequisites: str,
     env_info: str,
     scenario: str,
-    test_cases: Union[str, List[Dict[str, Any]]],
     output_file: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Execute markdown-to-Excel conversion: initialize template and add test cases.
-    Runs in parallel: init + all adds happen concurrently.
-    """
+    """Initialize an Excel workbook using markdown metadata."""
     try:
         if not output_file:
             raise ValueError("output_file must be provided for Excel generation")
         output_path = Path(output_file)
-        
-        # Parse test_cases if it's a JSON string (from LLM)
-        if isinstance(test_cases, str):
-            try:
-                import json
-                test_cases = json.loads(test_cases)
-            except (json.JSONDecodeError, ValueError):
-                logger.warning(f"Could not parse test_cases as JSON: {test_cases[:100]}")
-                test_cases = []
-        
-        # Ensure test_cases is a list
-        if not isinstance(test_cases, list):
-            logger.warning(f"test_cases is not a list: {type(test_cases)}")
-            test_cases = []
-        
-        # Initialize Excel template
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
         excel_path = init_testcase_excel(
             output_path,
             module_name=module_name,
@@ -1381,66 +1373,103 @@ def execute_process_md_to_excel(
             env_info=env_info,
             scenario=scenario
         )
-        
+
         if not excel_path:
             return {
                 "status": "error",
                 "message": "Failed to initialize Excel file (openpyxl not available)"
             }
-        
-        # Add all test cases (sequential but fast)
-        added_count = 0
-        errors = []
-        
-        for test_case in test_cases:
-            try:
-                case_id = test_case.get("case_id", "")
-                steps = test_case.get("steps", [])
-                test_input = test_case.get("test_input", "")
-                expected = test_case.get("expected_results", "")
-                
-                if not all([case_id, steps, expected]):
-                    errors.append(f"Skipped {case_id}: missing required fields")
-                    continue
-                
-                # If test_input is a JSON string array, parse it
-                if isinstance(test_input, str) and test_input.startswith("["):
-                    try:
-                        import json
-                        test_input = json.loads(test_input)
-                    except (json.JSONDecodeError, ValueError):
-                        # Keep as string if JSON parsing fails
-                        pass
-                
-                row = add_testcase_to_excel(
-                    excel_path,
-                    case_id=case_id,
-                    steps=steps,
-                    test_input=test_input,
-                    expected_results=expected
-                )
-                
-                if row is not None:
-                    added_count += 1
-                else:
-                    errors.append(f"Failed to add {case_id}")
-                    
-            except Exception as e:
-                logger.error(f"Error adding test case: {e}")
-                errors.append(f"Exception for {test_case.get('case_id', 'unknown')}: {str(e)}")
-        
+
         return {
             "status": "success",
             "file_path": str(excel_path),
-            "test_cases_added": added_count,
-            "errors": errors if errors else None
+            "message": "Initialized Excel workbook"
         }
-        
-    except Exception as e:
-        logger.error(f"MD-to-Excel conversion failed: {e}")
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(f"Excel initialization failed: {exc}")
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(exc)
+        }
+
+
+def execute_append_test_case_to_excel(
+    case_id: str,
+    steps: Union[str, List[str]],
+    expected_results: str,
+    test_input: Union[str, List[str], None] = "",
+    excel_file: Optional[str] = None
+) -> Dict[str, Any]:
+    """Append a single test case to an existing Excel workbook."""
+    try:
+        if not excel_file:
+            raise ValueError("excel_file must be provided when appending test cases")
+
+        excel_path = Path(excel_file)
+        if not excel_path.exists():
+            return {
+                "status": "error",
+                "message": f"Excel file not found: {excel_file}"
+            }
+
+        # Normalize steps into a clean list of strings
+        if isinstance(steps, str):
+            raw_steps = steps.replace("<br>", "\n").splitlines()
+            normalized_steps = [s.strip() for s in raw_steps if s.strip()]
+        else:
+            normalized_steps = [str(s).strip() for s in steps if str(s).strip()]
+
+        if not normalized_steps:
+            return {
+                "status": "error",
+                "message": f"No valid steps provided for case {case_id}"
+            }
+
+        # Normalize test input
+        inputs: Union[str, List[str]]
+        if isinstance(test_input, list):
+            inputs = [str(item).strip() for item in test_input]
+        elif isinstance(test_input, str):
+            stripped = test_input.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    import json
+                    parsed = json.loads(stripped)
+                    inputs = parsed if isinstance(parsed, list) else stripped
+                except (json.JSONDecodeError, ValueError):
+                    inputs = stripped
+            else:
+                inputs = stripped
+        else:
+            inputs = ""
+
+        row = add_testcase_to_excel(
+            excel_path,
+            case_id=case_id,
+            steps=normalized_steps,
+            test_input=inputs,
+            expected_results=expected_results
+        )
+
+        if row is None:
+            return {
+                "status": "error",
+                "message": f"Failed to append test case {case_id}"
+            }
+
+        return {
+            "status": "success",
+            "file_path": str(excel_path),
+            "row": row,
+            "message": f"Appended test case {case_id}"
+        }
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(f"Failed to append test case {case_id}: {exc}")
+        return {
+            "status": "error",
+            "message": str(exc)
         }
 
 def execute_markdown_to_pdf_fallback(
@@ -1515,7 +1544,7 @@ def call_md_to_excel_analyzer(client: genai.Client, md_file_path: Path, output_d
     
     # Build a more directive user message that explicitly tells the LLM to call a tool
     user_message = f"""\
-You MUST analyze this markdown and call exactly ONE tool.
+You MUST analyze this markdown and use the available tools.
 
 MARKDOWN FILE: {md_file_path.name}
 
@@ -1525,12 +1554,12 @@ MARKDOWN FILE: {md_file_path.name}
 
 INSTRUCTIONS:
 1. If this markdown contains Module Name, Spec ID, Description, Prerequisites, Environment, Scenario, and well-formed Test Cases:
-    Call: process_md_to_excel with the extracted fields.
-
+    a. Call initialize_markdown_excel with the metadata fields.
+    b. Call append_test_case_to_excel once per test case row you can extract (provide steps as a newline-separated string and test_input as a string).
+    c. After completing all tool calls, send a short acknowledgement message.
 2. If any required section is missing or malformed:
-    Call: markdown_to_pdf_fallback with a short reason (e.g., "missing prerequisites").
-
-YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
+    Call markdown_to_pdf_fallback with a short reason (e.g., "missing prerequisites").
+Do not send free-form text before the first required tool call.
 """
 
     if debug_dir:
@@ -1543,6 +1572,9 @@ YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
     
     config = types.GenerateContentConfig(
         temperature=0.1,  # Minimal temperature for deterministic tool calling
+        thinking_config = types.ThinkingConfig(
+            thinking_budget=0,
+        ),
         tools=[types.Tool(function_declarations=analyzer_tools)],
         system_instruction=MD_TO_EXCEL_ANALYZER_PROMPT
     )
@@ -1577,13 +1609,13 @@ YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
         "format": None,
         "status": "pending",
         "message": "",
-        "tool_calls": []  # Track all tool calls
+        "tool_calls": [],  # Track all tool calls
+        "test_cases_added": 0,
+        "errors": [],
+        "initialized": False
     }
     
     response_text = ""
-    
-    print(response)
-    print(response.candidates)
     
     # Process the response (non-streaming)
     if response.candidates:
@@ -1612,20 +1644,52 @@ YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
                         })
                     
                     try:
-                        if func_name == "process_md_to_excel":
+                        if func_name == "initialize_markdown_excel":
                             args.setdefault("output_file", str(output_dir / f"{md_file_path.stem}.xlsx"))
-                            exec_result = execute_process_md_to_excel(**args)
-                            result.update({
-                                "format": "excel",
-                                "status": exec_result.get("status"),
-                                "file_path": exec_result.get("file_path"),
-                                "message": f"Created Excel with {exec_result.get('test_cases_added', 0)} test cases"
-                            })
-                            logger.info(f"MD-to-Excel: {result['message']}")
-                            
+                            exec_result = execute_initialize_markdown_excel(**args)
+
+                            if exec_result.get("status") == "success":
+                                result.update({
+                                    "format": "excel",
+                                    "status": "initialized",
+                                    "file_path": exec_result.get("file_path"),
+                                    "message": exec_result.get("message", "Initialized Excel workbook")
+                                })
+                                result["initialized"] = True
+                                logger.info(f"MD-to-Excel init: {result['message']}")
+                            else:
+                                error_msg = exec_result.get("message", "Unknown initialization error")
+                                result["errors"].append(error_msg)
+                                result["status"] = "error"
+                                result["message"] = error_msg
+                                logger.error(f"MD-to-Excel init failed: {error_msg}")
+
                             if debug_dir:
-                                _write_debug_log(debug_dir, md_file_path.name, "exec_result_excel", exec_result)
-                            
+                                _write_debug_log(debug_dir, md_file_path.name, "exec_result_excel_init", exec_result)
+
+                        elif func_name == "append_test_case_to_excel":
+                            default_excel_path = result["file_path"] or str(output_dir / f"{md_file_path.stem}.xlsx")
+                            args.setdefault("excel_file", default_excel_path)
+                            exec_result = execute_append_test_case_to_excel(**args)
+
+                            if exec_result.get("status") == "success":
+                                result["file_path"] = exec_result.get("file_path", result["file_path"])
+                                result["format"] = "excel"
+                                result["test_cases_added"] += 1
+                                result["status"] = "success"
+                                result["message"] = f"Added {result['test_cases_added']} test case(s)"
+                                logger.info(f"MD-to-Excel append: {exec_result.get('message', '')}")
+                            else:
+                                error_msg = exec_result.get("message", "Unknown append error")
+                                result["errors"].append(error_msg)
+                                # Preserve success state if some cases added; mark partial success later
+                                if result["test_cases_added"] == 0:
+                                    result["status"] = "error"
+                                logger.error(f"MD-to-Excel append failed: {error_msg}")
+
+                            if debug_dir:
+                                _write_debug_log(debug_dir, md_file_path.name, "exec_result_excel_append", exec_result)
+
                         elif func_name == "markdown_to_pdf_fallback":
                             args.setdefault("markdown_file", str(md_file_path))
                             args.setdefault("output_file", str(output_dir / f"{md_file_path.stem}.pdf"))
@@ -1673,7 +1737,31 @@ YOU MUST CALL ONE OF THESE TOOLS. Do not respond without calling a tool.
         )
         result["status"] = "error"
 
-    
+        return result
+
+    if result["format"] == "excel" and result["initialized"]:
+        base_message = (
+            f"Initialized Excel and added {result['test_cases_added']} test case(s)"
+            if result["test_cases_added"] > 0
+            else "Initialized Excel workbook; no test cases appended"
+        )
+        if result["errors"]:
+            result["status"] = "partial_success" if result["test_cases_added"] > 0 else "error"
+            joined_errors = "; ".join(err for err in result["errors"] if err)
+            result["message"] = f"{base_message}. Issues: {joined_errors}" if joined_errors else base_message
+        else:
+            result["status"] = "success"
+            result["message"] = base_message
+    elif result["format"] == "excel" and not result["initialized"] and result["errors"]:
+        # Excel operations attempted but initialization failed
+        result["status"] = "error"
+        joined_errors = "; ".join(err for err in result["errors"] if err)
+        if joined_errors:
+            result["message"] = joined_errors
+
+    if not result["errors"]:
+        result["errors"] = None
+
     # Final summary log
     if debug_dir:
         _write_debug_log(debug_dir, md_file_path.name, "final_result", result)
