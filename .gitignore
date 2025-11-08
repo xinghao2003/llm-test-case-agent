@@ -220,3 +220,4 @@ context/
 context_logs/
 logs/
 results/
+session_logs/
